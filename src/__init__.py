@@ -8,7 +8,13 @@ from src.console import force_utf8_stdout
 from src.data import build_dataloaders
 from src.distributed import DistContext, reduce_sums, setup_distributed, wrap_model
 from src.model import build_model, count_parameters
-from src.train import build_lr_scheduler, evaluate, train_one_epoch
+from src.train import (
+    build_lr_scheduler,
+    build_optimizer,
+    evaluate,
+    set_seed,
+    train_one_epoch,
+)
 
 __all__ = [
     "TrainConfig",
@@ -16,6 +22,8 @@ __all__ = [
     "build_model",
     "count_parameters",
     "build_lr_scheduler",
+    "build_optimizer",
+    "set_seed",
     "evaluate",
     "train_one_epoch",
     "force_utf8_stdout",

@@ -23,7 +23,8 @@
 | **显存监控** | 每 epoch 打印当前/峰值显存 |
 | **checkpoint** | 保存最优权重 + 完整训练状态（含配置），支持早停 |
 | **分布式训练 (DDP)** | 同一份 `main.py` 单卡/多卡通用（`torchrun` 自动识别）；数据分片、梯度平均、指标归约、rank0 独占落盘；含不依赖 TCPStore 的启动器 |
-| **测试 + CI** | 129 个 pytest 用例（CPU 可跑，多平台 CI）；离线合成数据集，秒级验证整条流水线 |
+| **学习率 finder** | LR range test：训练前扫一遍 lr 报告该用多少；等比取点 + 偏差修正 EMA + 权重零污染还原，输出 ASCII 曲线 |
+| **测试 + CI** | 188 个 pytest 用例（CPU 可跑，多平台 CI）；离线合成数据集，秒级验证整条流水线 |
 
 ## 目录结构
 
@@ -35,7 +36,9 @@ pytorch-training-template/
 │   ├── data.py        # 数据加载：Dataset / DataLoader / transform + 分布式切分
 │   ├── model.py       # 模型定义 + 注册表（small_cnn / mlp）+ 梯度检查点
 │   ├── distributed.py # ⭐ DDP：进程组 / 数据切分 / 指标归约 / 模型包装
-│   ├── train.py       # ⭐ 训练循环核心：手写 step / 评测 / LR 调度
+│   ├── lr_finder.py   # ⭐ LR range test：等比扫描 / 稳健选点 / 权重快照还原
+│   ├── compile_support.py # torch.compile 的平台探测 + 冒烟 + 优雅降级
+│   ├── train.py       # ⭐ 训练循环核心：手写 step / 评测 / LR 调度 / 优化器
 │   └── main.py        # 入口：argparse + 日志 + checkpoint + 显存统计 + DDP
 ├── configs/
 │   └── mnist.yaml     # MNIST 标准配置
@@ -44,9 +47,11 @@ pytorch-training-template/
 │   ├── exp_checkpoint_granularity.py  # 梯度检查点单步拆解（显存 + 耗时）
 │   └── exp_ddp_equivalence.py         # DDP 等价性与吞吐实测
 ├── tools/
-│   ├── ddp_launch.py  # 用 FileStore 启动 DDP（绕开 TCPStore，Windows 也能跑）
-│   └── ddp_probe.py   # DDP 环境自检（能力门禁：环境不支持就明确 skip）
-├── tests/             # pytest：配置 / 数据 / 模型 / 训练循环 / 分布式 / 端到端 / CI 元测试
+│   ├── ddp_launch.py      # 用 FileStore 启动 DDP（绕开 TCPStore，Windows 也能跑）
+│   ├── ddp_probe.py       # DDP 环境自检（能力门禁：环境不支持就明确 skip）
+│   ├── compile_probe.py   # torch.compile 环境自检（探测 + 真编译一次，退出码 0/1/2）
+│   └── lr_finder.py       # 学习率扫描的命令行入口
+├── tests/             # pytest：配置 / 数据 / 模型 / 训练循环 / 分布式 / LR finder / 端到端 / CI 元测试
 ├── .github/workflows/ci.yml           # 多平台 CI：lint + 测试（CPU）
 ├── outputs/           # 训练产物（git 忽略）
 ├── pyproject.toml     # ruff 与 pytest 配置
@@ -96,7 +101,22 @@ torchrun --nproc_per_node=4 src/main.py --config configs/mnist.yaml
 python src/main.py --exp_name quicktest --epochs 1
 ```
 
-### 3. 显存账对照实验
+### 3. 学习率该给多少：先扫一遍
+
+```bash
+# 扫 100 步（MNIST 上约 16 秒），输出建议 lr + ASCII 曲线
+python tools/lr_finder.py --dataset mnist --steps 100
+
+# 顺便和当前的 lr 比一比（差多少倍会直接告诉你）
+python tools/lr_finder.py --config configs/mnist.yaml --lr 1e-3
+
+# 不下载数据也能试（合成数据只有 8 个 batch，会提示"已循环复用"）
+python tools/lr_finder.py --dataset synthetic --steps 40
+```
+
+输出 `outputs/lr_finder/lr_sweep.md`（结论 + 曲线）与 `lr_sweep.json`（完整数据）。
+
+### 4. 显存账对照实验
 
 ```bash
 # 7 个变体全跑（约 6 分钟）
@@ -116,11 +136,11 @@ python experiments/exp_ddp_equivalence.py
 输出 `outputs/exp_memory/memory_accounting.md`、`outputs/exp_ckpt_granularity/checkpoint_granularity.md`
 与 `outputs/exp_ddp/ddp_equivalence.md`。
 
-### 4. 跑测试
+### 5. 跑测试
 
 ```bash
 pip install -r requirements-dev.txt
-pytest                                    # 129 个用例，CPU 上约 1.5 分钟
+pytest                                    # 188 个用例，CPU 上约 2 分钟
 ruff check src experiments tests tools    # lint
 
 # 不想等下载？用内置的合成数据集跑通整条流水线
@@ -142,7 +162,10 @@ python tools/ddp_launch.py --nproc_per_node 2 -- src/main.py --dataset synthetic
 | `tests/test_model.py` | 输入尺寸推算、参数量、**检查点不改变梯度**、BN 双倍更新（canary） |
 | `tests/test_train.py` | LR 调度取值、**更新次数 = ⌈批次数 / 累积步数⌉**、`no_grad` 生效、loss 真的会降 |
 | `tests/test_distributed.py` | **DDP 梯度等价性（含 BN 反例）**、各 rank 切分不重不漏、`set_epoch` 真的换了顺序、`ctx=None` 判空约定 |
-| `tests/test_smoke.py` | 真实 CLI 端到端跑通 + 产物落盘 + 命令行覆盖生效 + **非 UTF-8 输出编码下中文日志不崩** |
+| `tests/test_compile.py` | 平台探测（用 `platform_name` 让 Windows 分支在 Linux CI 上也能测）、冒烟不污染 BN、`unwrap_model` 剥嵌套包装、平台限制（canary） |
+| `tests/test_lr_finder.py` | 等比取点、**EMA 的偏差修正**、最陡下降选点、**扫描后权重逐位还原**、该关的开关都关了、结果可复现 |
+| `tests/test_smoke.py` | 真实 CLI 端到端跑通 + 产物落盘 + 命令行覆盖生效 + **非 UTF-8 输出编码下中文日志不崩** + 入口清单完整性 |
+| `tests/test_ci_annotations.py` | 诊断通道本身：`_emit` 编码无关性、hook 触发与转义、端到端断言退出码是 1 而不是 3 |
 
 两条值得单独说的测试思路：
 
@@ -227,12 +250,18 @@ hook 其实没崩，注解是被 GitHub **丢弃**的（原因是下面第三条
 **三条教训，都固化成了代码**：
 
 - **「下次记得」靠不住，把不变式写成测试**。现在
-  `test_entrypoint_pins_utf8_stdout` 会扫描**全部 6 个可执行入口**，少一个就红。
+  `test_entrypoint_pins_utf8_stdout` 会扫描**全部可执行入口**，少一个就红。
   写这条测试时还发现第一版断言太松 —— 只查函数名，而
   `from console import force_utf8_stdout` 这种「导入但没调用」也能骗过它，
   于是收紧成必须出现**带括号的调用**。
   顺带把实现从 `src/__init__.py` 挪进了零依赖的 `src/console.py`：`import src`
   要 **6.4 秒**（连锁导入 torch），而 `tools/` 下的启动器不该为一行工具函数付这个代价。
+- **然后「清单」自己漂了**。加 `tools/compile_probe.py` 时忘了往入口清单里加一行 ——
+  那个入口就变成「**看起来被不变式守着，实际上没被扫**」，比完全没有这条测试更危险。
+  修法不是在清单里补一行就完事，而是加一条
+  `test_every_executable_entrypoint_is_covered`：扫出仓库里所有带 `__main__` 块的文件，
+  断言它们和清单**完全一致**。现在「忘了加一行」会变成一次明确的失败
+  （报 `漏了 ['tools/lr_finder.py']`），而不是悄悄少覆盖一个入口。
 - **诊断通道自己也要有测试**。`tests/test_ci_annotations.py` 用 12 条用例从三层
   守它：`_emit` 的编码无关性、hook 的触发条件与输出格式，以及一条**端到端**用例
   真的在 cp1252 下起一个 pytest，断言退出码必须是 **1 而不是 3**。
@@ -488,18 +517,106 @@ python src/main.py --compile --compile_backend cudagraphs --dataset synthetic --
 > 在小模型 + 短 step 上，编译开销可能比省下的时间还大 —— 所以本仓库把它做成可选项
 > 而不是默认打开，这本身就是工程判断的一部分。
 
+## 学习率 finder（LR range test）
+
+### 它在回答什么问题
+
+「学习率给多少」是训练里最贵的超参 —— 猜错了要么震荡发散，要么慢到你以为代码有 bug。
+LR range test 的思路很朴素：**先用 100 步把这件事测出来，而不是靠反复重训去试。**
+
+从 `1e-7` 出发**等比**升到 `1.0`，每一步换一个 lr、更新一次参数、记一次 loss，
+就得到一条「loss vs log(lr)」曲线：先平、再缓缓下降、然后陡然上升。
+取**最低点之前、下降最陡**的那个 lr 作为建议值。
+
+> ⚠️ **不是取 loss 最低的那个点**。最低点往往已经贴着发散边缘，用它训练迟早炸。
+> 要的是「性价比最高」的点：斜率最陡 = 每升高一个 lr 数量级，换来的 loss 下降最多。
+
+### 实测（MNIST / small_cnn / AdamW / batch 128 / 100 步）
+
+| 指标 | 值 |
+|------|-----|
+| **建议 lr** | **1.262e-3**（第 58 步，loss 下降最陡处） |
+| 扫描内平滑 loss 最低 | 1.2859（出现在 lr=1.96e-1） |
+| 发散点 | lr ≈ 8.50e-1 |
+| 本模板默认的 lr | 1e-3 —— 与建议值差 **0.79×**（同量级） |
+| 整个扫描的耗时 | **16 秒**（CPU，100 步） |
+
+```
+  （横轴对数刻度，纵轴 loss；X = 建议的 lr）
+    5.494 |                                                   .|
+    5.073 |                                                    |
+    4.652 |                                                    |
+    4.231 |                                                    |
+    3.811 |                                                    |
+    3.390 |                                                    |
+    2.969 |                                                    |
+    2.548 |                                                  . |
+    2.127 |..............................                      |
+    1.707 |                              X.....              . |
+    1.286 |                                    ..............  |
+          +----------------------------------------------------+
+           1.0e-07                                      8.5e-01
+```
+
+这条曲线有两个可读的信息：**左边那段平坦**说明 lr 太小时模型几乎没动（1e-7 到 1e-5
+的 loss 完全一样），**右边那个陡升**就是发散。X 落在两者之间、斜率最陡的地方。
+
+> 顺带验证了一件事：本模板默认的 `lr=1e-3` 和扫描建议值只差 0.79 倍 ——
+> 一个经验默认值和一个实测值碰上了，说明这个默认选得不离谱。
+> （但注意：这个数**不是模型的性质**，是「这份配置 + 这份数据」的性质，换了就要重扫。）
+
+### 三个做错就会「静默给出错误建议」的细节
+
+这个模块最危险的地方在于：**它错了也照样画出一条漂亮的曲线**。所以三条都写了测试：
+
+| 细节 | 做错的后果 | 为什么 |
+|------|-----------|--------|
+| 平滑要用**带偏差修正**的 EMA | 「最陡下降」落在曲线开头，**建议值退化成 min_lr** | 朴素 EMA 的初值是 0，`out[0] = (1-β)·loss₀ ≈ 0.02·loss₀`，前几步被人为压低。除以 `1-β^(t+1)` 才是无偏的（测试断言 `out[0] == losses[0]`） |
+| 扫描时必须**关掉梯度裁剪** | 建议值**偏高**，选出来的 lr 一开训就炸 | 裁剪的作用正是压住梯度爆炸 —— 开着它，lr 到 1.0 也不炸，曲线上该有的陡升拐点就看不见了 |
+| 扫描时必须**关掉 AMP** | 曲线混入与 lr 无关的抖动 | `GradScaler` 会动态改 scale、必要时跳过 step，等于往曲线里塞了第二个变量 |
+
+同理还有两条：**不做梯度累积**（保证「一个点 = 一次更新 = 一个 lr」），
+以及**优化器类型 / weight_decay 保持和真实训练一致**（最优点依赖它们）。
+这五条都收在 `resolve_sweep_config()` 里，每一项都带理由，也都有测试守着。
+
+### 为什么它必须「不动模型」
+
+扫描会故意把 lr 推到发散 —— 也就是说，**跑完之后权重里很可能已经是 NaN**。
+函数在开始时对权重做一次快照、在 `finally` 里原样还原，模型跟没扫过一样。
+
+不还原的后果不是「精度差一点」，而是**接下来的训练从 NaN 权重出发**，
+你看着 loss 是 NaN，会以为是「选的这个 lr 有问题」，其实是 finder 没收拾干净。
+测试里把还原摘掉的失败信息很直观：权重从 `0.0025` 被推到了 `538`。
+
+另外，还原是**逐位**的，BN 的 `running_mean` / `num_batches_tracked` 也一起还原
+（扫描跑在 train 模式，统计量会被污染）。
+
+### 局限（别把建议值当真理）
+
+- 它给的是**起点附近**的最优 lr。训练中途由 scheduler 决定，不是恒定的一个值。
+  实战用法是：拿它当上界，再**除以 2~3** 起步，配合 warmup。
+- 数据量不够时会循环复用 batch（曲线被轻微压低），这种情况下结果里会有明确提示，
+  不会悄悄糊过去 —— 本仓库的原则是**拿不到的数据就不报**。
+
+> 面试点：这类工具的价值在于**把「猜」变成「测」**，但前提是你要能说清
+> 它测的是什么、在什么条件下成立、以及哪几个开关必须关掉。
+> 一个「跑起来了」的 lr finder 和一个「建议值可信」的 lr finder 之间，
+> 差的就是上面那张表。
+
 ## 核心代码位置（想学就看这几个文件）
 
 | 想学什么 | 看哪里 |
 |---------|-------|
 | 训练 step 的完整顺序 | `src/train.py` 的 `train_one_epoch()` |
-| 显存优化的每一项 | `src/train.py` 模块 docstring + `src/main.py` 的 `build_optimizer()` |
+| 显存优化的每一项 | `src/train.py` 模块 docstring + `src/train.py` 的 `build_optimizer()` |
 | **梯度检查点怎么实现、坑在哪** | `src/model.py` 的 `SmallCNN.forward()` docstring |
 | 配置怎么做到可复现 | `src/config.py` 的 `merge()` / `to_yaml()` |
 | 为什么必须切 `train()`/`eval()` | `src/train.py` 的 `evaluate()` |
 | 验证集为什么必须切 | `src/data.py` 的 `split_train_val()` |
 | **DDP 的进程组 / 数据切分 / 指标归约** | `src/distributed.py`（模块 docstring 列了三个必踩的坑） |
 | `torchrun` 不可用时怎么跑多进程 | `tools/ddp_launch.py`（FileStore rendezvous） |
+| **学习率该给多少** | `src/lr_finder.py`（模块 docstring 列了三个会让建议值静默出错的地方） |
+| `torch.compile` 在 Windows 上为什么用不了 | `src/compile_support.py` + `tools/compile_probe.py` |
 | 入口的编码保护为什么必须存在 | `src/console.py`（同一个坑踩过两次的记录） |
 | CI 的失败注解是怎么发的、坑在哪 | `tests/conftest.py` 的 `pytest_runtest_logreport()` |
 
@@ -603,13 +720,29 @@ Decoupled weight decay——权重衰减不参与 Adam 的动量/二阶矩计算
 把 pytest 退出码从 1 变成 3，于是"CI 红了却什么都读不到"。
 分辨方法是看退出码 —— **3 是 hook 崩了，1 是注解被 GitHub 丢弃**（格式问题）。
 
+**Q21: LR range test 为什么不取 loss 最低的那个点？**
+因为最低点通常已经贴着**发散边缘**，用它训练迟早炸。要取的是**最低点之前、loss 下降最陡**
+的那个 lr —— 它的含义是"每升高一个 lr 数量级，能换多少 loss 下降"，即性价比最高的点。
+实际用法是把它当**上界**，再除以 2~3 起步配合 warmup（它给的是起点附近的最优，不是全程最优）。
+
+**Q22: 一个 lr finder 怎么做才算"可信"？**
+"跑起来画出一条曲线"和"建议值可信"之间隔着三件事，而且**做错了照样画出漂亮的曲线**：
+① 平滑必须用**带偏差修正**的 EMA（朴素 EMA 初值为 0，前几步被压低 → 最陡点落到曲线开头
+→ 建议值退化成 min_lr）；② 必须**关掉梯度裁剪**（它正是压住发散的东西，开着就看不到拐点
+→ 建议值偏高）；③ 必须**关掉 AMP**（GradScaler 会引入与 lr 无关的噪声）。
+还有两条容易漏的：扫描只允许一次参数更新对应一个 lr（不做梯度累积），
+以及优化器/weight_decay 要和真实训练一致（最优点依赖它们）。
+最后一条同样重要：扫完**必须把权重逐位还原** —— 扫描会把 lr 推到发散，
+不还原就是把 NaN 权重交给接下来的训练，而你会以为是"选的 lr 有问题"。
+
 ## 后续可扩展
 
 - [x] `gradient checkpointing` 演示（用计算换显存的量化对比）
 - [x] 分布式训练（DDP）最小可跑示例 + 等价性/吞吐实测
 - [x] `torch.compile` 支持 + 平台可用性实测（Windows 上 Inductor 两条路都断、退路后端可跑通；
       真正的加速对比需要 Linux —— 本机拿不到，所以没编数据）
-- [ ] 学习率 finder（LR range test）
+- [x] 学习率 finder（LR range test）：等比扫描 + 偏差修正 EMA + 权重零污染还原，
+      实测 MNIST 上 100 步 16 秒、建议值 1.262e-3（与默认 lr 差 0.79×）
 
 ## License
 

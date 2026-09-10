@@ -286,10 +286,35 @@ ENTRYPOINTS = [
     "src/main.py",
     "tools/ddp_launch.py",
     "tools/ddp_probe.py",
+    "tools/compile_probe.py",
+    "tools/lr_finder.py",
     "experiments/exp_memory_accounting.py",
     "experiments/exp_checkpoint_granularity.py",
     "experiments/exp_ddp_equivalence.py",
 ]
+
+
+def test_every_executable_entrypoint_is_covered():
+    """清单必须**完整** —— 仓库里每个带 `__main__` 块的文件都得在里面。
+
+    为什么要有这条：只把清单写死还不够，**清单自己会漂**。
+    加 `tools/compile_probe.py` 时忘了往上面加一行，于是那个入口
+    「看起来被不变式守着，实际上没被扫」—— 比完全没有这条测试更危险，
+    因为它会让人以为已经覆盖了。
+
+    这条测试把「忘了加一行」变成一次明确的失败，而不是悄悄少覆盖一个入口。
+    """
+    declared = set(ENTRYPOINTS)
+    found: set[str] = set()
+    for folder in ("src", "tools", "experiments"):
+        for path in sorted((ROOT / folder).glob("*.py")):
+            if '__name__ == "__main__"' in path.read_text(encoding="utf-8"):
+                found.add(f"{folder}/{path.name}")
+
+    assert found == declared, (
+        f"入口清单与实际不一致 —— 漏了 {sorted(found - declared)}，"
+        f"或列了不存在的 {sorted(declared - found)}"
+    )
 
 
 @pytest.mark.parametrize("rel", ENTRYPOINTS)

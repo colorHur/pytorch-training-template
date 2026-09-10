@@ -32,14 +32,67 @@ PyTorch 的 .backward() 是 **累加** 梯度到 .grad，而不是覆盖。
 from __future__ import annotations
 
 import math
+import random
 import time
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from src.distributed import ddp_no_sync, reduce_sums
+
+
+# ============================================================
+# 可复现性
+# ============================================================
+def set_seed(seed: int) -> None:
+    """固定所有随机源，保证实验可复现。
+
+    ⚠️ 面试点：完全可复现还需要 cudnn.deterministic=True，但会损失性能。
+       通常做法是固定 seed + 不开 deterministic，允许浮点层面的微小差异。
+
+    ⚠️ 为什么放在 `train.py` 而不是 `main.py`：学习率 finder 也要在同样的
+       初始权重上扫描，两边必须用**同一套**种子设置，否则扫出来的建议值
+       和真实训练根本不是同一个模型。
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+# ============================================================
+# 优化器
+# ============================================================
+def build_optimizer(model: nn.Module, cfg) -> torch.optim.Optimizer:
+    """按配置建优化器。
+
+    AdamW vs SGD（面试常问）
+    ----------------------
+    - AdamW：自适应学习率（每参数单独缩放），收敛快、对 lr 不敏感，是默认选择。
+              W 表示 decoupled weight decay —— 权重衰减不参与梯度动量计算，比 L2 正则更干净。
+    - SGD+momentum：泛化有时更好（尤其 CV），但需要精调 lr + warmup + 长训练。
+    经验：拿不准就用 AdamW。
+
+    ⚠️ 为什么这个函数放在 `train.py` 而不是 `main.py`：
+       学习率 finder（`lr_finder.py`）必须用**同一个**优化器构造逻辑 ——
+       最优学习率依赖于优化器类型与 weight_decay，复制一份迟早会走偏。
+    """
+    if cfg.optimizer == "adamw":
+        return torch.optim.AdamW(
+            model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay
+        )
+    if cfg.optimizer == "sgd":
+        return torch.optim.SGD(
+            model.parameters(),
+            lr=cfg.lr,
+            momentum=cfg.momentum,
+            weight_decay=cfg.weight_decay,
+            nesterov=True,
+        )
+    raise KeyError(f"未知优化器 '{cfg.optimizer}'，可选：adamw / sgd")
 
 
 # ============================================================

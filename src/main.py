@@ -20,12 +20,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import random
 import sys
 import time
 from pathlib import Path
 
-import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -46,7 +44,13 @@ from src.distributed import (
     wrap_model,
 )
 from src.model import build_model, count_parameters, enable_gradient_checkpointing
-from src.train import build_lr_scheduler, evaluate, train_one_epoch
+from src.train import (
+    build_lr_scheduler,
+    build_optimizer,
+    evaluate,
+    set_seed,
+    train_one_epoch,
+)
 
 HERE = Path(__file__).resolve().parent.parent
 
@@ -54,18 +58,6 @@ HERE = Path(__file__).resolve().parent.parent
 # ============================================================
 # 工具函数
 # ============================================================
-def set_seed(seed: int) -> None:
-    """固定所有随机源，保证实验可复现。
-
-    ⚠️ 面试点：完全可复现还需要 cudnn.deterministic=True，但会损失性能。
-       通常做法是固定 seed + 不开 deterministic，允许浮点层面的微小差异。
-    """
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-
 def gpu_mem_str() -> str:
     """当前 + 峰值显存（GB）。"""
     if not torch.cuda.is_available():
@@ -109,31 +101,6 @@ def save_checkpoint(path: Path, model, optimizer, epoch, global_step, cfg, metri
         },
         path,
     )
-
-
-def build_optimizer(model: nn.Module, cfg: TrainConfig):
-    """按配置建优化器。
-
-    AdamW vs SGD（面试常问）
-    ----------------------
-    - AdamW：自适应学习率（每参数单独缩放），收敛快、对 lr 不敏感，是默认选择。
-              W 表示 decoupled weight decay —— 权重衰减不参与梯度动量计算，比 L2 正则更干净。
-    - SGD+momentum：泛化有时更好（尤其 CV），但需要精调 lr + warmup + 长训练。
-    经验：拿不准就用 AdamW。
-    """
-    if cfg.optimizer == "adamw":
-        return torch.optim.AdamW(
-            model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay
-        )
-    if cfg.optimizer == "sgd":
-        return torch.optim.SGD(
-            model.parameters(),
-            lr=cfg.lr,
-            momentum=cfg.momentum,
-            weight_decay=cfg.weight_decay,
-            nesterov=True,
-        )
-    raise KeyError(f"未知优化器 '{cfg.optimizer}'，可选：adamw / sgd")
 
 
 def parse_args() -> argparse.Namespace:
