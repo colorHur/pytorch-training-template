@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from src.compile_support import CompileOutcome, maybe_compile, probe_compile_support
 from src.config import TrainConfig
 from src.console import force_utf8_stdout
 from src.data import build_dataloaders
@@ -22,6 +23,9 @@ __all__ = [
     "reduce_sums",
     "setup_distributed",
     "wrap_model",
+    "CompileOutcome",
+    "maybe_compile",
+    "probe_compile_support",
 ]
 
 __version__ = "1.0.0"

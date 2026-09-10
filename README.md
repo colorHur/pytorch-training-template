@@ -430,6 +430,64 @@ run with USE_LIBUV=0 to disable it
 
 > 真实训练环境（Linux + 多卡）请用 `torchrun`：它带弹性容错和更完善的进程管理。
 
+## `torch.compile`：为什么它在 Windows 上通常用不了
+
+`torch.compile(model)` 在 Linux 上基本是一行搞定的加速手段，但在 Windows 上
+**两条路都是断的**（都是实测出来的，不是推测）：
+
+| 设备 | 报错 | 根因 |
+|------|------|------|
+| CUDA | `TritonMissing: Cannot find a working triton installation.` | Inductor 的 GPU 后端靠 **Triton** 生成 kernel，而 PyTorch **不提供 Windows 版 triton wheel** |
+| CPU | `InductorError: RuntimeError: Compiler: cl is not found.` | Inductor 的 CPU 后端要把生成的 C++ 编译成动态库，需要 **MSVC 的 `cl.exe`** |
+
+两个报错里没有一个字提到「你缺什么、怎么修」，而且**发生在训练第 1 步**
+（`torch.compile()` 本身只做标记，真正的编译是懒的）。
+
+### 本仓库怎么处理
+
+`src/compile_support.py` 把这件事拆成三步，风格与「梯度检查点 / SyncBatchNorm」
+一致 —— **能开就开，开不了要说清楚为什么**：
+
+1. **主动探测**（`probe_compile_support`）：训练开始前就判断当前「平台 + 设备」
+   能不能用这个后端，给出结构化的原因和退路；
+2. **冒烟编译**（`smoke_compile`）：拿真实形状的输入先跑一次前向，把「第 1 步才炸」
+   提前到启动阶段，顺便量出**首次编译的开销**；
+3. **明确降级**：任何一步失败都回退到未编译的模型并打印原因，**训练照常继续**。
+
+探测和冒烟两件都要做：探测负责把「注定失败」提前拦下，冒烟负责兜住「探测想不到的
+失败」—— 前者是推断，后者才是 ground truth，而平台行为是会变的。
+
+### 实测（本机 Windows + RTX 3060）
+
+| 后端 | 是否需要 kernel 生成 | CPU | CUDA |
+|------|-------------------|-----|------|
+| `inductor`（默认） | 需要 Triton / MSVC | ❌ 缺 `cl.exe` | ❌ 缺 Triton |
+| `aot_eager` | 不需要 | ✅ 可用 | ✅ 可用 |
+| `cudagraphs` | 不需要 | ✅ 可用 | ✅ 可用 |
+
+自检工具：
+
+```bash
+python tools/compile_probe.py --all      # 探测 + 真编译一次，报告缺什么、有什么退路
+```
+
+退出码 **0 / 1 / 2** = 「默认后端可用 / 只有退路可用 / 全不可用」，可以直接当门禁用。
+
+> ⚠️ 说清楚，别误导：**`aot_eager` 不是加速手段** —— 它只做图捕获与算子分解、不做
+> kernel 生成，通常不快甚至更慢，价值在于「验证图能不能被捕获」。`cudagraphs` 省的是
+> kernel launch 开销，只在小模型 + 短 step 上可能有效。真想要 Inductor 的加速，
+> 得走 Linux / WSL，或自行装非官方 triton-windows / MSVC。
+
+```bash
+# 想试就在命令行上开（本机的 CUDA 上会用 cudagraphs 跑通）
+python src/main.py --compile --compile_backend cudagraphs --dataset synthetic --epochs 1
+```
+
+> 面试点：`torch.compile` **不等于「一定更快」**。它是懒加载 + **按输入形状特化**的：
+> 首次调用要付编译成本（本项目会把它单独打印出来），输入形状一变还要重编译。
+> 在小模型 + 短 step 上，编译开销可能比省下的时间还大 —— 所以本仓库把它做成可选项
+> 而不是默认打开，这本身就是工程判断的一部分。
+
 ## 核心代码位置（想学就看这几个文件）
 
 | 想学什么 | 看哪里 |
@@ -549,7 +607,8 @@ Decoupled weight decay——权重衰减不参与 Adam 的动量/二阶矩计算
 
 - [x] `gradient checkpointing` 演示（用计算换显存的量化对比）
 - [x] 分布式训练（DDP）最小可跑示例 + 等价性/吞吐实测
-- [ ] `torch.compile` 加速对比
+- [x] `torch.compile` 支持 + 平台可用性实测（Windows 上 Inductor 两条路都断、退路后端可跑通；
+      真正的加速对比需要 Linux —— 本机拿不到，所以没编数据）
 - [ ] 学习率 finder（LR range test）
 
 ## License

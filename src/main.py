@@ -34,6 +34,7 @@ import torch.nn as nn
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src import force_utf8_stdout
+from src.compile_support import maybe_compile
 from src.config import TrainConfig
 from src.data import build_dataloaders
 from src.distributed import (
@@ -166,6 +167,18 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=None,
         help="梯度检查点：用多算一次前向换取激活显存",
+    )
+    p.add_argument(
+        "--compile",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="torch.compile：把训练 step 编译成优化后的图（Windows 上默认后端通常不可用，见 README）",
+    )
+    p.add_argument(
+        "--compile_backend",
+        type=str,
+        default=None,
+        help="编译后端，默认 inductor；它不可用时可以试 aot_eager / cudagraphs",
     )
     p.add_argument("--log_interval", type=int, default=None)
     p.add_argument("--early_stop_patience", type=int, default=None)
@@ -328,6 +341,30 @@ def run_training() -> None:
     # ---- 包成 DDP（单进程时原样返回）----
     model = wrap_model(model, ctx)
 
+    # ---- torch.compile（可选项）----
+    # 放在 DDP **外层**：PyTorch 推荐把 compile 包在最外面 —— 这样它能看到并优化
+    # 通信相关的算子；顺序反过来也能跑，但优化视野更窄。
+    #
+    # 为什么可能"开了却没生效"：Windows 上 inductor 后端的两条路都是断的
+    # （CUDA 缺 Triton、CPU 缺 MSVC 的 cl.exe），而且报错发生在**训练第 1 步**、
+    # 信息里还不提"缺什么、怎么修"。所以这里主动探测 + 冒烟前向，开不了就带着
+    # 原因回退，训练照常继续。
+    compile_outcome = maybe_compile(
+        model,
+        enabled=cfg.compile,
+        backend=cfg.compile_backend,
+        device=device,
+        example_input=(
+            torch.randn(cfg.batch_size, cfg.in_channels, image_size, image_size, device=device)
+            if cfg.compile
+            else None
+        ),
+    )
+    model = compile_outcome.model
+    compile_active = compile_outcome.active
+    if cfg.compile:
+        log(f"      torch.compile：{compile_outcome.message}")
+
     steps_per_epoch = len(loaders["train"]) // cfg.grad_accum_steps
     total_steps = steps_per_epoch * cfg.epochs
     lr_schedule = build_lr_scheduler(optimizer, cfg.lr_scheduler, total_steps, cfg.warmup_steps)
@@ -432,6 +469,12 @@ def run_training() -> None:
         "total_params": total,
         "trainable_params": trainable,
         "gradient_checkpointing_active": ckpt_active,
+        "torch_compile": {
+            "enabled": cfg.compile,
+            "active": compile_active,
+            "backend": cfg.compile_backend,
+            "first_call_seconds": round(compile_outcome.first_call_seconds, 3),
+        },
         "distributed": {
             "enabled": ctx.enabled,
             "backend": ctx.backend,

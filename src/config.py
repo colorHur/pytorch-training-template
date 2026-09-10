@@ -59,6 +59,8 @@ class TrainConfig:
     amp: bool = False                # 自动混合精度（fp16 + GradScaler）
     channels_last: bool = False      # NHWC 内存布局，卷积上更快
     gradient_checkpointing: bool = False  # 用计算换显存：反向时重算激活值
+    compile: bool = False            # torch.compile：把训练 step 编译成优化后的图
+    compile_backend: str = "inductor"  # 编译后端；Windows 上 inductor 常不可用，见 compile_support.py
 
     # ---- 日志与保存 ----
     log_interval: int = 50           # 每多少 step 打一次日志

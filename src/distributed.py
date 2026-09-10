@@ -324,16 +324,26 @@ def wrap_model(model: nn.Module, ctx: DistContext | None) -> nn.Module:
 
 
 def unwrap_model(model: nn.Module) -> nn.Module:
-    """取出 DDP 包在里面的原始模型；非 DDP 时原样返回。
+    """剥掉 DDP（`.module`）与 `torch.compile`（`._orig_mod`）的包装，拿到原始模型。
 
     ⚠️ 存 checkpoint 前**必须**先 unwrap。否则 `state_dict()` 的 key 会带
-       `module.` 前缀（`module.blocks.0.0.weight`），单进程加载时全部对不上 ——
+       `module.`（或 `_orig_mod.`）前缀，单进程加载时全部对不上 ——
        存出来一个别人用不了的权重文件，而且当时看不出任何异常。
 
-    `getattr(model, "module", model)` 比 `isinstance(model, DDP)` 更通用，
-    也能兼容 DataParallel 和其它包装器。
+    为什么要**循环**剥：两种包装可以嵌套（`compile(DDP(model))` 或反过来），
+    只剥一层就会漏；`getattr(model, "module", model)` 这种写法也兼容
+    DataParallel 和其它包装器。
+
+    这里已经为此栽过一次（加 DDP 时忘了 unwrap），所以补了嵌套用例
+    `test_unwrap_model_handles_nested_wrappers` 把两层的组合钉死。
     """
-    return getattr(model, "module", model)
+    while True:
+        if hasattr(model, "_orig_mod"):     # torch.compile 的 OptimizedModule
+            model = model._orig_mod
+        elif hasattr(model, "module"):      # DDP / DataParallel
+            model = model.module
+        else:
+            return model
 
 
 def maybe_convert_sync_bn(model: nn.Module, enabled: bool, ctx: DistContext | None) -> bool:

@@ -342,3 +342,47 @@ def test_ddp_launcher_survives_non_utf8_stdout():
     )
     assert "UnicodeEncodeError" not in proc.stderr
     assert "用法" in proc.stdout            # 中文确实完整写出来了
+
+
+# ============================================================
+# torch.compile：要么真编译上，要么说清楚为什么没编译上
+# ============================================================
+def test_compile_with_fallback_backend_runs_training(tmp_path):
+    """`--compile --compile_backend aot_eager` 必须真的编译，并且跑完整条流程。
+
+    aot_eager 不经过 Inductor 的 kernel 生成，因此既不依赖 Triton 也不依赖
+    MSVC —— 这是能**跨平台稳定断言"编译路径真的被走到了"**的那个选项。
+    """
+    proc, run_dir = run_main(
+        tmp_path, "--epochs", "1", "--batch_size", "128",
+        "--compile", "--compile_backend", "aot_eager", exp_name="e2e_compile",
+    )
+    assert proc.returncode == 0, proc.stdout[-2500:]
+
+    summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+    meta = summary["torch_compile"]
+    assert meta["enabled"] is True
+    assert meta["active"] is True
+    assert meta["backend"] == "aot_eager"
+    assert meta["first_call_seconds"] > 0      # 首次前向含编译，必须量出来
+    assert "已编译" in proc.stdout
+
+
+def test_compile_never_breaks_training(tmp_path):
+    """默认后端（inductor）无论环境支不支持，训练都必须能跑完。
+
+    这条测的是**降级**：Linux 上 inductor 通常能编译成功，Windows 上会因缺
+    Triton / MSVC 而不可用 —— 但两条路都不允许把训练带崩，而且必须在日志里
+    说清发生了什么（静默忽略比报错更难查，这个项目已经栽过几次）。
+    """
+    proc, run_dir = run_main(
+        tmp_path, "--epochs", "1", "--batch_size", "128",
+        "--compile", exp_name="e2e_compile_inductor",
+    )
+    assert proc.returncode == 0, proc.stdout[-2500:]
+
+    summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+    assert summary["torch_compile"]["enabled"] is True
+    assert "torch.compile：" in proc.stdout
+    if not summary["torch_compile"]["active"]:
+        assert "不可用" in proc.stdout or "失败" in proc.stdout
