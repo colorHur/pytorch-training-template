@@ -17,9 +17,12 @@ jobs:
         python-version: ["3.11"]
 
     steps:
-      - uses: actions/checkout@v4
+      # 两个 action 都升到 Node 24 一代：GitHub 会对 target Node 20 的 action
+      # 在每次运行打一条 deprecation 注解，绿跑看起来也不干净。
+      # （checkout 最新是 v7，v7 的变更是 fork PR 的安全策略，本工作流用不到。）
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
