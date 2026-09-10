@@ -37,31 +37,34 @@ def _annotation_payload(report) -> str:
 def pytest_runtest_logreport(report) -> None:
     """失败时打印 GitHub Actions 的 `::error::` 工作流命令。
 
-    为什么需要：Actions 的**日志接口要鉴权**，而 check-run 的
-    annotations 接口对公开仓库是匿名可读的。把关键错误行提升成 annotation，
-    等于给自己留了一个不用登录就能拿到失败原因的通道 ——
-    不然就只能拿到一句毫无信息量的 "Process completed with exit code 1"。
+    为什么需要：Actions 的**日志接口要鉴权**（实测 `/actions/jobs/{id}/logs` 返回 403），
+    而 check-run 的 annotations 接口对公开仓库匿名可读。把关键错误行提升成
+    annotation，等于留了一个不用登录就能拿到失败原因的通道 ——
+    否则从外部只能看到一句毫无信息量的 "Process completed with exit code 1"。
 
-    只在 CI 上生效，本地跑测试不会多出这些噪声行。
+    ---
+    ⚠️ 三个实测踩出来的细节，少一个就等于没发：
+
+    1. **必须覆盖 setup / call / teardown 三个阶段**。
+       最初只处理了 `when == "call"`，结果 fixture 里抛错（比如 module 级 fixture
+       启动子进程失败）完全收不到 —— 而 pytest 的退出码依然是 1，
+       现象就是"CI 红了，但 annotation 里什么都没有"，非常误导。
+    2. **必须补一个前导换行**：pytest 的进度字符（`-q` 下的 `F`）会顶在同一行前面，
+       而 GitHub 只解析**行首**的工作流命令。
+    3. **必须带 `file=`**：不带文件归属的 `::error::` 不会出现在 annotations 接口里。
+
+    只在 CI 上生效（`GITHUB_ACTIONS=true`），本地跑测试不会多出噪声行。
     """
     if os.environ.get("GITHUB_ACTIONS") != "true":
         return
-    if report.when != "call" or not report.failed:
+    if not report.failed:
         return
 
     payload = _annotation_payload(report)
     if not payload:
         return
 
-    # `file=` 是必需的：实测不带文件归属的 ::error:: 不会出现在 check-run 的
-    # annotations 接口里（runner 自己那条「Process completed with exit code 1」
-    # 是带 file/line 的）。归属到真实出错的测试文件，比挂到 conftest 上更有用。
     path, _, _ = report.nodeid.partition("::")
     nodeid = report.nodeid.replace("\n", " ")
-    # 开头的换行是必需的：pytest 的进度字符（-q 下的 F）会顶在这一行前面，
-    # 而 GitHub 只解析**行首**的工作流命令 —— 不换行就等于没发。
-    # 换行会让 GitHub 只取第一行，所以 payload 里也要压成单行。
-    print(
-        f'\n::error file={path},line=1,title=pytest 失败 {nodeid}::{payload}',
-        flush=True,
-    )
+    title = f"pytest 失败[{report.when}] {nodeid}"
+    print(f'\n::error file={path},line=1,title={title}::{payload}', flush=True)
