@@ -65,7 +65,7 @@ def test_run_completes_and_reports(default_run):
 
 def test_all_artifacts_are_written(default_run):
     _, run_dir = default_run
-    for name in ["best.pt", "summary.json", "config_resolved.yaml", "train.log"]:
+    for name in ["best.pt", "last.pt", "summary.json", "config_resolved.yaml", "train.log"]:
         assert (run_dir / name).exists(), f"缺少产物 {name}"
 
 
@@ -87,6 +87,23 @@ def test_checkpoint_is_loadable_and_carries_config(default_run):
     assert set(ckpt) >= {"model", "optimizer", "epoch", "global_step", "config", "metrics"}
     assert ckpt["config"]["epochs"] == 1
     assert "blocks.0.0.weight" in ckpt["model"]   # 主干参数在里面
+
+
+def test_checkpoint_carries_everything_a_resume_needs(default_run):
+    """`best.pt` 不只是"权重 + 配置"：它（和 `last.pt`）必须能**把训练接下去**。
+
+    续训要的六类状态见 `src/checkpoint.py` 的表。这里逐项点名，
+    将来谁把某一项从 payload 里删掉，这条测试会直接指出来是哪一个。
+    """
+    _, run_dir = default_run
+    ckpt = torch.load(run_dir / "last.pt", map_location="cpu", weights_only=False)
+    for key in (
+        "model", "optimizer", "epoch", "global_step",
+        "best_val_acc", "patience_counter", "history", "config", "metrics", "rng",
+    ):
+        assert key in ckpt, f"last.pt 缺了续训必需的 {key}"
+    assert {"torch", "python", "numpy", "loader"} <= set(ckpt["rng"])
+    assert ckpt["format_version"] >= 2
 
 
 def test_config_resolved_matches_yaml_loader(default_run):
@@ -124,6 +141,100 @@ def test_unsupported_model_warns_instead_of_failing(tmp_path):
     summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
     assert summary["gradient_checkpointing_active"] is False
     assert "未实现梯度检查点" in proc.stdout
+
+
+# ============================================================
+# 断点续训：真的从存档处接下去
+# ============================================================
+def test_resume_continues_from_the_saved_epoch(tmp_path):
+    """跑 1 轮 → `--resume last` 接着跑到 2 轮。"""
+    first, run_dir = run_main(
+        tmp_path, "--epochs", "1", "--batch_size", "128", exp_name="e2e_resume"
+    )
+    assert first.returncode == 0, first.stdout[-2500:]
+    assert (run_dir / "last.pt").exists(), "没有 last.pt 就没法 --resume last"
+
+    second, _ = run_main(
+        tmp_path, "--epochs", "2", "--batch_size", "128", "--resume", "last",
+        exp_name="e2e_resume",
+    )
+    assert second.returncode == 0, second.stdout[-2500:]
+
+    summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+    assert summary["resume"]["enabled"] is True
+    assert summary["resume"]["from_epoch"] == 1
+    assert summary["resume"]["restored_everything"] is True
+    assert summary["resume"]["missing_keys"] == []
+    # history 是**接着写**的：长度 2 且编号连续，说明第 1 轮的记录被恢复了
+    assert [row["epoch"] for row in summary["history"]] == [1, 2]
+    assert "已训完 1 个 epoch" in second.stdout
+
+    # 改大 --epochs 会让 cosine 调度按新的总步数重新规划 —— 这件事必须被说出来，
+    # 否则用户会以为"续训 = 接着那条曲线走"
+    assert "--epochs 由 1 改成 2" in second.stdout
+
+
+def test_resume_reproduces_uninterrupted_training(tmp_path):
+    """本里程碑的核心断言：**1 轮 + 断点 + 2 轮** ≡ **连续 3 轮**（逐位一致）。
+
+    为什么敢断言"逐位"：这个模板把随机性的四个来源都关在明处 ——
+    固定 seed、显式 shuffle generator、`num_workers=0`、CPU 上不开 AMP/compile。
+    所以只要**存全了**（权重 / 优化器矩 / global_step / 早停基准 / RNG / 数据顺序），
+    续训就必须严丝合缝地等于连续训练。差一点，说明漏了某样东西。
+
+    注意这里两次都传 `--epochs 3`。这不是巧合：
+    `total_steps = steps_per_epoch × epochs`，把 epochs 调大的话 cosine 曲线会被
+    整体重新规划，**连已经训过的那几轮都对不上**（"接着训到更多轮"和"崩了重来"
+    本来就是两件事，前者不该要求逐位等价）。上面那条测试专门盯着这个提示。
+    """
+    full, full_dir = run_main(
+        tmp_path, "--epochs", "3", "--batch_size", "128", "--save_every_epoch",
+        exp_name="e2e_full",
+    )
+    assert full.returncode == 0, full.stdout[-2500:]
+    epoch1 = full_dir / "epoch1.pt"
+    assert epoch1.exists(), "没有 --save_every_epoch 就拿不到「跑到第 1 轮就崩」的现场"
+
+    resumed, resumed_dir = run_main(
+        tmp_path, "--epochs", "3", "--batch_size", "128",
+        "--resume", str(epoch1), exp_name="e2e_resumed",
+    )
+    assert resumed.returncode == 0, resumed.stdout[-2500:]
+    assert "将从第 2 个 epoch 继续" in resumed.stdout
+
+    uninterrupted = torch.load(full_dir / "last.pt", map_location="cpu", weights_only=False)
+    restored = torch.load(resumed_dir / "last.pt", map_location="cpu", weights_only=False)
+
+    assert (uninterrupted["epoch"], restored["epoch"]) == (3, 3)
+    assert uninterrupted["global_step"] == restored["global_step"] > 0, (
+        "global_step 没被恢复的话，lr 调度会错位 —— 权重也就跟着对不上了"
+    )
+    assert [h["train_loss"] for h in uninterrupted["history"]] == [
+        h["train_loss"] for h in restored["history"]
+    ], "loss 序列对不上，说明某一轮的随机状态没有被完整恢复"
+
+    differing = [
+        key for key in uninterrupted["model"]
+        if not torch.equal(uninterrupted["model"][key], restored["model"][key])
+    ]
+    assert not differing, (
+        f"续训与连续训练的权重不再逐位一致，涉及 {len(differing)} 个张量：{differing[:5]}"
+    )
+
+
+def test_resume_with_a_missing_checkpoint_fails_loudly(tmp_path):
+    """路径写错必须**当场失败**，绝不能悄悄从头开始训。
+
+    这是续训最危险的失败模式：用户以为接上了，实际白训一遍，而 summary 里的
+    loss 曲线看起来一切正常 —— 等发现时已经烧掉了几个小时的 GPU 时间。
+    """
+    proc, run_dir = run_main(
+        tmp_path, "--epochs", "1", "--batch_size", "128", "--resume", "no_such_ckpt.pt",
+        exp_name="e2e_resume_missing",
+    )
+    assert proc.returncode != 0, "续训路径不存在，进程却正常退出了"
+    assert "no_such_ckpt.pt" in proc.stdout + proc.stderr
+    assert not (run_dir / "summary.json").exists(), "没恢复成功却写了 summary —— 等于假装训练完成"
 
 
 # ============================================================

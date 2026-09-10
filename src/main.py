@@ -13,6 +13,9 @@
 
     # 不开配置文件，纯命令行
     python -m src.main --exp_name quicktest --epochs 1
+
+    # 断点续训：从这个 run 上次停下的地方接着训（last.pt 每个 epoch 都会落盘）
+    python -m src.main --config configs/mnist.yaml --resume last
 """
 
 from __future__ import annotations
@@ -32,6 +35,13 @@ import torch.nn as nn
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src import force_utf8_stdout
+from src.checkpoint import (
+    ResumeState,
+    diff_configs,
+    load_checkpoint,
+    resolve_resume_path,
+    save_checkpoint,
+)
 from src.compile_support import maybe_compile
 from src.config import TrainConfig
 from src.data import build_dataloaders
@@ -53,6 +63,12 @@ from src.train import (
 )
 
 HERE = Path(__file__).resolve().parent.parent
+
+# ⚠️ 这些是**运行控制**参数，不是配置项，必须从"覆盖 TrainConfig"的集合里剔除。
+#    `TrainConfig.merge()` 对未知键是直接抛 ValueError 的 —— 这是好事（配置项
+#    拼错了会立刻报错），但也意味着任何新增的运行参数都得同时加到这里，
+#    否则 `--resume xxx` 会以一个"未知配置项：['resume']"的报错收场。
+RUN_ONLY_ARGS = {"config", "resume"}
 
 
 # ============================================================
@@ -79,33 +95,16 @@ def gpu_name() -> str | None:
     return None
 
 
-def save_checkpoint(path: Path, model, optimizer, epoch, global_step, cfg, metrics) -> None:
-    """保存 checkpoint。
-
-    为什么要把 cfg 也存进去？
-      半年后回看这个实验，只有权重没有超参 = 无法复现。配置跟着 checkpoint 走。
-
-    为什么必须先 unwrap？
-      DDP 包装后 `model.state_dict()` 的 key 会变成 `module.blocks.0.0.weight`。
-      存成那样，单进程代码就加载不了了 —— 而且保存时不会有任何报错。
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "model": unwrap_model(model).state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "epoch": epoch,
-            "global_step": global_step,
-            "config": cfg.to_dict(),
-            "metrics": metrics,
-        },
-        path,
-    )
-
-
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="PyTorch 训练模板")
     p.add_argument("--config", type=str, default=None, help="YAML 配置文件路径")
+    p.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        help="从 checkpoint 继续训练。可写 'last' / 'best'（本 run 目录下的同名文件）"
+        "或任意 .pt 路径",
+    )
 
     # 全部默认 None —— merge() 会忽略 None，实现「命令行 > YAML」的优先级
     p.add_argument("--exp_name", type=str, default=None)
@@ -149,6 +148,12 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--log_interval", type=int, default=None)
     p.add_argument("--early_stop_patience", type=int, default=None)
+    p.add_argument(
+        "--save_every_epoch",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="每个 epoch 都存一份 epoch{N}.pt（默认由配置决定）",
+    )
     p.add_argument("--device", type=str, default=None, choices=["auto", "cuda", "cpu"])
     p.add_argument(
         "--sync_bn",
@@ -178,8 +183,8 @@ def run_training() -> None:
     args = parse_args()
 
     # ---- 组装配置：YAML -> 命令行覆盖 ----
-    # 注意：`--config` 是运行参数，不是配置项，必须从覆盖集合里剔除
-    overrides = {k: v for k, v in vars(args).items() if k != "config"}
+    # 注意：`--config` / `--resume` 是运行参数，不是配置项，必须从覆盖集合里剔除
+    overrides = {k: v for k, v in vars(args).items() if k not in RUN_ONLY_ARGS}
     cfg = TrainConfig.from_yaml(args.config) if args.config else TrainConfig()
 
     # AMP + CPU 的冲突要在这里先化解：TrainConfig 的校验会直接抛 ValueError，
@@ -349,20 +354,80 @@ def run_training() -> None:
         + ("（配置要求开但模型不支持，已忽略）" if cfg.gradient_checkpointing and not ckpt_active else "")
     )
 
+    # ---- 断点续训：把进度和随机流恢复到刚才建好的这些对象里 ----
+    # 位置很关键，必须在「model / optimizer / scaler / loader 都已建好」之后、
+    # 「训练循环开始」之前：
+    #   - `set_seed(cfg.seed)` 已经在上面跑过了，这里再叠一层 RNG 还原，顺序不能反
+    #   - model 已经包了 DDP / compile，所以传进去的必须是 `unwrap_model(model)`
+    #     （存的时候剥掉了前缀，读的时候也得是剥掉的那个）
+    #   - 此时**还没有开始迭代**，loader 的 shuffle generator 状态是干净的初值，
+    #     覆盖它不会丢掉任何东西
+    state = ResumeState()
+    resume_path: Path | None = None
+    resumed_from_epoch: int | None = None
+    if args.resume is not None:
+        resume_path = resolve_resume_path(args.resume, run_dir)
+        if not resume_path.exists():
+            raise FileNotFoundError(
+                f"--resume {args.resume!r} 解析到 {resume_path}，但该文件不存在"
+            )
+        state = load_checkpoint(
+            resume_path,
+            model=unwrap_model(model),
+            optimizer=optimizer,
+            scaler=scaler,
+            loader=loaders["train"],
+            device=device,
+        )
+        resumed_from_epoch = state.epoch
+        log(f"\n  ↩ 续训：从 {resume_path} 恢复")
+        log(f"       {state.describe()}")
+        if state.missing:
+            log(
+                "       ⚠️ 这些状态没被恢复，只能当默认值用 —— 续训结果会和"
+                "连续训练**不完全一致**（老格式 checkpoint 的正常现象）"
+            )
+        # 关键超参变了要说出来：恢复 optimizer 状态之后，lr 调度器还会用新配置的
+        # base_lr 覆盖回去，等于"换学习率重新调度"，而 loss 曲线上看不出断点。
+        for key, saved_value, current_value in diff_configs(state.config, cfg.to_dict()):
+            log(f"       ⚠️ 配置与原实验不同：{key}: {saved_value} → {current_value}")
+
+        # `epochs` 是唯一一个"变了也正常、但会改变训练语义"的配置，所以单独说。
+        # 原因：cosine / step 调度的 `total_steps = steps_per_epoch × epochs`，
+        # 把它调大 → 整条 lr 曲线被重新规划 → 连**已经训过的那几轮**都对不上了。
+        saved_epochs = state.config.get("epochs")
+        if saved_epochs is not None and saved_epochs != cfg.epochs:
+            log(
+                f"       ℹ️ --epochs 由 {saved_epochs} 改成 {cfg.epochs}："
+                f"「{cfg.lr_scheduler}」调度会按新的总步数（{total_steps}）重新规划，"
+                f"所以这条学习率曲线与「一次训到 {cfg.epochs} 轮」不可逐位对齐。"
+                "想要严格等价的断点恢复（比如崩了重来），--epochs 要和原来一样。"
+            )
+
+    # 这份 config 是**本次运行实际生效**的配置（含 num_classes/in_channels 等
+    # 由数据集推导出来的字段），存进 checkpoint 才算完整可复现。
+    state.config = cfg.to_dict()
+
     # ---- 训练 ----
-    log(f"\n[4/5] 开始训练（{cfg.epochs} epochs）...\n")
-    history: list[dict] = []
-    best_val_acc = 0.0
+    last_path = run_dir / "last.pt"
     best_path = run_dir / "best.pt"
-    patience_counter = 0
-    global_step = 0
+    resumed_note = f"，从第 {state.next_epoch} 个 epoch 继续" if resume_path is not None else ""
+    log(f"\n[4/5] 开始训练（{cfg.epochs} epochs{resumed_note}）...\n")
+    if state.next_epoch > cfg.epochs:
+        log(
+            f"  ⚠️ checkpoint 里已经训完 {state.epoch} 个 epoch，而 --epochs={cfg.epochs} ——"
+            f" 没有要训的轮次了。要接着训就把 --epochs 调大。"
+        )
     t_train = time.time()
 
-    for epoch in range(1, cfg.epochs + 1):
+    # ⚠️ 从这里开始，`state` 就是进度的**唯一真相**（epoch / global_step /
+    #    best_val_acc / patience_counter / history）。不再另起一组同名局部变量 ——
+    #    两份状态并存，迟早会出现"存下去的那份和用来判断的那份不一样"。
+    for epoch in range(state.next_epoch, cfg.epochs + 1):
         # ⚠️ 每个 epoch 必须调一次，否则每轮的 shuffle 顺序完全相同（等于没打乱）
         set_epoch(train_sampler, epoch)
 
-        train_stats, global_step = train_one_epoch(
+        train_stats, state.global_step = train_one_epoch(
             model=model,
             loader=loaders["train"],
             optimizer=optimizer,
@@ -370,7 +435,7 @@ def run_training() -> None:
             device=device,
             epoch=epoch,
             cfg=cfg,
-            global_step=global_step,
+            global_step=state.global_step,
             lr_schedule=lr_schedule,
             total_steps=total_steps,
             scaler=scaler,
@@ -378,15 +443,24 @@ def run_training() -> None:
             ctx=ctx,
         )
         val_stats = evaluate(model, loaders["val"], criterion, device, ctx=ctx)
+        state.epoch = epoch
+
+        improved = val_stats["acc"] > state.best_val_acc
+        if improved:
+            state.best_val_acc = val_stats["acc"]
+            state.patience_counter = 0
+        else:
+            state.patience_counter += 1
 
         log(
             f"  ▶ epoch {epoch}/{cfg.epochs}  "
             f"train_loss {train_stats['loss']:.4f} train_acc {train_stats['acc']:.4f} | "
             f"val_loss {val_stats['loss']:.4f} val_acc {val_stats['acc']:.4f} | "
             f"{train_stats['time']:.1f}s | {gpu_mem_str()}"
+            + ("  ★新最优" if improved else "")
         )
 
-        history.append(
+        state.history.append(
             {
                 "epoch": epoch,
                 "train_loss": train_stats["loss"],
@@ -398,30 +472,53 @@ def run_training() -> None:
             }
         )
 
-        # ---- 保存最优 & 早停（只有 rank 0 落盘；早停条件各 rank 一致，不会分叉）----
-        if val_stats["acc"] > best_val_acc:
-            best_val_acc = val_stats["acc"]
-            if ctx.is_main:
-                save_checkpoint(best_path, model, optimizer, epoch, global_step, cfg, val_stats)
-            patience_counter = 0
-        else:
-            patience_counter += 1
-            if cfg.early_stop_patience > 0 and patience_counter >= cfg.early_stop_patience:
-                log(f"  ⏹ 早停触发（val_acc 连续 {patience_counter} 个 epoch 未提升）")
-                break
+        # ---- 落盘（只有 rank 0 写；早停条件各 rank 一致，不会分叉）----
+        # 三个文件的职责不同，别混：
+        #   best.pt      val 有提升时才写 —— 最后评测用
+        #   last.pt      **每个 epoch 都写** —— 续训的默认目标（见 --resume last）
+        #   epoch{N}.pt  save_every_epoch 时才写 —— 事后挑某一轮做对比
+        if ctx.is_main:
+            for path, enabled in (
+                (best_path, improved),
+                (last_path, True),
+                (run_dir / f"epoch{epoch}.pt", cfg.save_every_epoch),
+            ):
+                if enabled:
+                    save_checkpoint(
+                        path,
+                        state=state,
+                        model=model,
+                        optimizer=optimizer,
+                        scaler=scaler,
+                        loader=loaders["train"],
+                        metrics=val_stats,
+                    )
 
-        if cfg.save_every_epoch and ctx.is_main:
-            save_checkpoint(run_dir / f"epoch{epoch}.pt", model, optimizer, epoch, global_step, cfg, val_stats)
+        # 早停判定放在**落盘之后**：否则最后一轮的 last.pt 缺一个 epoch，
+        # 续训时会从更早的位置重来一遍（白算一轮）。
+        if cfg.early_stop_patience > 0 and state.patience_counter >= cfg.early_stop_patience:
+            log(f"  ⏹ 早停触发（val_acc 连续 {state.patience_counter} 个 epoch 未提升）")
+            break
 
     train_time = time.time() - t_train
+    history = state.history
+    best_val_acc = state.best_val_acc
 
     # ---- 测试集最终评测（只跑一次）----
-    # 非主进程也要读同一个 best.pt —— 所以必须 barrier 等 rank 0 写完再读，
+    # 非主进程也要读同一个文件 —— 所以必须 barrier 等 rank 0 写完再读，
     # 否则会读到一个写了一半的文件。
     barrier(ctx)
-    log("\n[5/5] 用最优权重在测试集上评测...")
-    ckpt = torch.load(best_path, map_location=device, weights_only=False)
+    # 正常情况用 best.pt；但如果本次是从别的 run 续训、而这个 run 目录里
+    # 从没轮到过 val 提升（best_val_acc 是从 checkpoint 带过来的），best.pt
+    # 可能压根不存在 —— 那就退回 last.pt，并说清楚用的是哪个，别静默换掉。
+    eval_path = best_path if best_path.exists() else last_path
+    if eval_path != best_path:
+        log(f"\n[5/5] {best_path.name} 不存在（本次续训没有刷新最优），改用 {eval_path.name}")
+    else:
+        log("\n[5/5] 用最优权重在测试集上评测...")
+    ckpt = torch.load(eval_path, map_location=device, weights_only=False)
     unwrap_model(model).load_state_dict(ckpt["model"])
+    del ckpt                       # 权重已拷进模型，别让它白占一份显存
     test_stats = evaluate(model, loaders["test"], criterion, device, ctx=ctx)
     log(f"      测试集：loss {test_stats['loss']:.4f} | acc {test_stats['acc']:.4f}")
 
@@ -449,6 +546,16 @@ def run_training() -> None:
             "sync_bn": sync_bn_active,
             # 全局等效 batch = 本地 micro batch × 梯度累积 × 进程数
             "global_effective_batch_size": cfg.effective_batch_size * ctx.world_size,
+        },
+        # 续训是一等公民，就得和 compile / distributed 一样在 summary 里留痕 ——
+        # 否则事后看一个 0.98 的实验，分不清它是"一次训了 10 轮"还是"续了 5 次"。
+        "resume": {
+            "enabled": resume_path is not None,
+            "path": str(resume_path) if resume_path is not None else None,
+            "from_epoch": resumed_from_epoch,
+            "restored_everything": not state.missing,
+            "missing_keys": list(state.missing),
+            "eval_weights": eval_path.name,
         },
         "best_val_acc": best_val_acc,
         "test_acc": test_stats["acc"],

@@ -2,6 +2,15 @@
 
 from __future__ import annotations
 
+from src.checkpoint import (
+    ResumeState,
+    capture_rng,
+    diff_configs,
+    load_checkpoint,
+    resolve_resume_path,
+    restore_rng,
+    save_checkpoint,
+)
 from src.compile_support import CompileOutcome, maybe_compile, probe_compile_support
 from src.config import TrainConfig
 from src.console import force_utf8_stdout
@@ -34,6 +43,13 @@ __all__ = [
     "CompileOutcome",
     "maybe_compile",
     "probe_compile_support",
+    "ResumeState",
+    "save_checkpoint",
+    "load_checkpoint",
+    "capture_rng",
+    "restore_rng",
+    "resolve_resume_path",
+    "diff_configs",
 ]
 
 __version__ = "1.0.0"

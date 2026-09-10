@@ -21,10 +21,11 @@
 | **手写 LR 调度** | warmup + cosine/step，能看到 lr 每一步怎么变（不是黑盒 `scheduler.step()`） |
 | **梯度裁剪** | 按全局 L2 范数裁剪，防梯度爆炸 |
 | **显存监控** | 每 epoch 打印当前/峰值显存 |
-| **checkpoint** | 保存最优权重 + 完整训练状态（含配置），支持早停 |
+| **checkpoint** | 每个 epoch 落 `last.pt`（续训目标）+ 最优 `best.pt`；含配置与**全部可恢复状态** |
+| **断点续训** | `--resume last` 接着训；恢复权重 / Adam 矩 / `global_step` / 早停基准 / 两股随机流 → 与连续训练**逐位一致** |
 | **分布式训练 (DDP)** | 同一份 `main.py` 单卡/多卡通用（`torchrun` 自动识别）；数据分片、梯度平均、指标归约、rank0 独占落盘；含不依赖 TCPStore 的启动器 |
 | **学习率 finder** | LR range test：训练前扫一遍 lr 报告该用多少；等比取点 + 偏差修正 EMA + 权重零污染还原，输出 ASCII 曲线 |
-| **测试 + CI** | 190 个 pytest 用例（CPU 可跑，多平台 CI）；离线合成数据集，秒级验证整条流水线 |
+| **测试 + CI** | 221 个 pytest 用例（CPU 可跑，多平台 CI）；离线合成数据集，秒级验证整条流水线 |
 
 ## 目录结构
 
@@ -36,10 +37,11 @@ pytorch-training-template/
 │   ├── data.py        # 数据加载：Dataset / DataLoader / transform + 分布式切分
 │   ├── model.py       # 模型定义 + 注册表（small_cnn / mlp）+ 梯度检查点
 │   ├── distributed.py # ⭐ DDP：进程组 / 数据切分 / 指标归约 / 模型包装
+│   ├── checkpoint.py  # ⭐ 断点续训：要恢复的六类状态 + 两股随机流 + 老格式兼容
 │   ├── lr_finder.py   # ⭐ LR range test：等比扫描 / 稳健选点 / 权重快照还原
 │   ├── compile_support.py # torch.compile 的平台探测 + 冒烟 + 优雅降级
 │   ├── train.py       # ⭐ 训练循环核心：手写 step / 评测 / LR 调度 / 优化器
-│   └── main.py        # 入口：argparse + 日志 + checkpoint + 显存统计 + DDP
+│   └── main.py        # 入口：argparse + 日志 + checkpoint + 断点续训 + DDP
 ├── configs/
 │   └── mnist.yaml     # MNIST 标准配置
 ├── experiments/
@@ -51,7 +53,7 @@ pytorch-training-template/
 │   ├── ddp_probe.py       # DDP 环境自检（能力门禁：环境不支持就明确 skip）
 │   ├── compile_probe.py   # torch.compile 环境自检（探测 + 真编译一次，退出码 0/1/2）
 │   └── lr_finder.py       # 学习率扫描的命令行入口
-├── tests/             # pytest：配置 / 数据 / 模型 / 训练循环 / 分布式 / LR finder / 端到端 / CI 元测试
+├── tests/             # pytest：配置 / 数据 / 模型 / 训练循环 / 分布式 / checkpoint / LR finder / 端到端 / CI 元测试
 ├── .github/workflows/ci.yml           # 多平台 CI：lint + 测试（CPU）
 ├── outputs/           # 训练产物（git 忽略）
 ├── pyproject.toml     # ruff 与 pytest 配置
@@ -97,6 +99,13 @@ python src/main.py --config configs/mnist.yaml --gradient_checkpointing
 # 分布式训练（多进程）—— 同一份代码，torchrun 会自动识别
 torchrun --nproc_per_node=4 src/main.py --config configs/mnist.yaml
 
+# 断点续训：从这个 run 上次停下的地方接着训（last.pt 每个 epoch 都会落盘）
+python src/main.py --config configs/mnist.yaml --resume last --epochs 10
+
+# 从最优权重接着训 / 从任意存档接着训
+python src/main.py --config configs/mnist.yaml --resume best
+python src/main.py --config configs/mnist.yaml --resume outputs/mnist_cnn/epoch3.pt
+
 # 纯命令行（不用配置文件）
 python src/main.py --exp_name quicktest --epochs 1
 ```
@@ -141,7 +150,7 @@ python experiments/exp_ddp_equivalence.py
 
 ```bash
 pip install -r requirements-dev.txt
-pytest                                    # 190 个用例，CPU 上约 2 分钟
+pytest                                    # 221 个用例，CPU 上约 3 分钟
 ruff check src experiments tests tools    # lint
 
 # 不想等下载？用内置的合成数据集跑通整条流水线
@@ -165,7 +174,8 @@ python tools/ddp_launch.py --nproc_per_node 2 -- src/main.py --dataset synthetic
 | `tests/test_distributed.py` | **DDP 梯度等价性（含 BN 反例）**、各 rank 切分不重不漏、`set_epoch` 真的换了顺序、`ctx=None` 判空约定 |
 | `tests/test_compile.py` | 平台探测（用 `platform_name` 让 Windows 分支在 Linux CI 上也能测）、冒烟不污染 BN、`unwrap_model` 剥嵌套包装、平台限制（canary） |
 | `tests/test_lr_finder.py` | 等比取点、**EMA 的偏差修正**、最陡下降选点、**扫描后权重逐位还原**、该关的开关都关了、结果可复现 |
-| `tests/test_smoke.py` | 真实 CLI 端到端跑通（`src/main.py` 与 `tools/lr_finder.py`）+ 产物落盘 + 命令行覆盖生效 + **非 UTF-8 输出编码下中文日志不崩** + 入口清单完整性 |
+| `tests/test_checkpoint.py` | 六类状态逐项往返、**两股随机流各自可还原**、老格式能读且 `missing` 报得准、剥包装前缀、`--resume` 取值解析 → 三条**反证**（摘掉某一项，结果真的会变） |
+| `tests/test_smoke.py` | 真实 CLI 端到端跑通（`src/main.py` 与 `tools/lr_finder.py`）+ 产物落盘 + 命令行覆盖生效 + **1 轮 + 断点 + 2 轮 ≡ 连续 3 轮（逐位）** + **续训路径写错必须当场失败** + **非 UTF-8 输出编码下中文日志不崩** + 入口清单完整性 |
 | `tests/test_ci_annotations.py` | 诊断通道本身：`_emit` 编码无关性、hook 触发与转义、端到端断言退出码是 1 而不是 3 |
 
 两条值得单独说的测试思路：
@@ -278,6 +288,34 @@ hook 其实没崩，注解是被 GitHub **丢弃**的（原因是下面第三条
 > 面试点：这类问题的价值不在"修了一个 bug"，而在**把一次性修复变成永久的不变式**。
 > 同一个坑出现第二次时，正确的动作不是再修一次，而是问"第一次修完为什么没防住第二次"——
 > 答案通常是：**修的是那个点，没修那类事**。
+
+### 一条"看起来在测 A、其实恒真"的测试
+
+写断点续训的测试时又撞上一次，这次是**测试本身**的问题，而且比上次隐蔽：
+
+验证"不恢复 RNG 就会出问题"的第一版长这样 ——
+
+```python
+with_rng = loss_after_resume(restore_rng=True)
+without_rng = loss_after_resume(restore_rng=False)   # 里面手动 manual_seed 一个别的值
+assert with_rng != without_rng
+```
+
+看起来挺有说服力。然后我把 `load_checkpoint` 里那行 `restore_rng(...)` **整行注释掉**，
+跑测试 —— **绿的**。
+
+因为它其实是个**恒真命题**：两次不同的随机状态当然给出不同的 loss。
+它证明的是"随机性有影响"，而不是"`load_checkpoint` 还原了它"。
+换句话说，这条测试即便加载函数完全没实现 RNG 恢复，也照样过。
+
+修法是换成**对着机制断言**：存档那一刻之后"下一次抽样应该得到什么"是确定的，
+还原后抽出来的必须逐值相等。改完再做一次同样的反证，两条测试立刻变红。
+
+> 判断一条测试强不强，有个很便宜的动作：**把被测的那行代码删掉，看它是红还是绿**。
+> 绿的就说明它没测到那一行，"看起来测了"和"测到了"是两件事。
+> 这个仓库里每条关键状态都配了这样一次反证 —— 断点续训这边一共做了三次：
+> 摘掉 optimizer 状态恢复 → 2 条红；摘掉 RNG 恢复 → 2 条红；
+> 存 checkpoint 时不传 loader → 端到端等价性测试红。
 
 ## 实测基准
 
@@ -604,6 +642,127 @@ LR range test 的思路很朴素：**先用 100 步把这件事测出来，而�
 > 一个「跑起来了」的 lr finder 和一个「建议值可信」的 lr finder 之间，
 > 差的就是上面那张表。
 
+## 断点续训（`--resume`）
+
+### 它原来是个假功能
+
+改造之前 `save_checkpoint` 存了六样东西（`model` / `optimizer` / `epoch` /
+`global_step` / `config` / `metrics`），README 写着「保存完整训练状态」。
+但全仓库唯一的 `torch.load` 是训练结束后把 `best.pt` 读回来在测试集上评一次分 ——
+**没有任何一处能把训练接下去**。
+
+这里有个通用教训：**存了但没人读的状态，等于没存**。
+`optimizer` 的 `state_dict` 写得对不对、`epoch` 记的是"已训完"还是"下一轮"、
+`global_step` 有没有跟着调度器走 —— 在没有加载方的时候，写错了也永远没人发现。
+
+所以这一轮不是"加一个 `--resume` 参数"，而是先把**要恢复什么**列清楚。
+
+### 要恢复的六类状态
+
+| 状态 | 漏了会怎样 |
+|------|-----------|
+| `optimizer.state_dict()` | Adam 的一阶/二阶矩和 step 计数被重置 → **续训后 loss 先尖峰再回落**。最容易漏，因为它不报错、也不影响"能不能跑" |
+| `global_step` | lr 调度错位：cosine 从头开始 → 等于偷偷改了学习率计划 |
+| `epoch` | ① 数据顺序回到第 1 轮的 shuffle；② 早停/最优判断的基准丢失 |
+| `best_val_acc` + `patience_counter` | **静默的逻辑错误**：基准清零 → `best.pt` 可能被一个更差的 epoch 覆盖；早停计数清零 → 早停永远触发不了 |
+| `scaler.state_dict()`（开 AMP 时） | GradScaler 的 scale 回到初值 → 前几步可能溢出、被跳过 |
+| RNG（两股流，见下） | Dropout mask 和每轮 shuffle 顺序不再一致 → 严格复现失败 |
+
+### RNG 是两股流，不是一股
+
+1. **全局 torch RNG** —— `small_cnn` 里有 Dropout，每次前向都在消耗它。
+2. **`train_loader.generator`** —— 单进程 shuffle 用的那个 `torch.Generator`，
+   每轮 `__iter__` 都会推进它。
+
+为了让这两件事互不干扰，`src/data.py` 里给训练集的 DataLoader **显式传了一个固定
+seed 的 generator**。不传的话，`DataLoader(shuffle=True)` 每轮会从全局 RNG 现取一
+个种子 —— 于是 Dropout 多抽一次都会改变下一轮的数据顺序。两股流缠在一起，
+既说不清、也没法分开还原。
+
+还有一点反直觉：**只存种子是不够的**。种子还原出来的永远是第 1 轮的顺序，而
+"已经迭代到第几轮"这个信息只存在于 generator 的当前状态里，所以存的是
+`generator.get_state()`。
+
+### 实测：续训与连续训练逐位一致
+
+`--epochs 3 --batch_size 128 --save_every_epoch` 跑一次拿到 `epoch1.pt`，
+再从它 `--resume` 接着训 —— 对比"一次连续跑完 3 轮"：
+
+| 指标 | 连续 3 轮 | 1 轮 + 续训 2 轮 |
+|------|----------|-----------------|
+| `epoch` / `global_step` | 3 / 24 | 3 / 24 |
+| `history` 长度 | 3 | 3（第 1 轮是恢复来的） |
+| 逐位不同的参数张量 | — | **0 / 18** |
+| 各轮 `train_loss` | 0.6148 / 0.0015 / 0.0008 | 完全相同 |
+
+为什么敢断言"逐位"：这个模板把随机性的来源都关在明处（固定 seed、显式 shuffle
+generator、`num_workers=0`、CPU 上不开 AMP / compile），所以只要**存全了**，
+续训就必须严丝合缝。差一点，就说明漏了某一样 —— 这正是这条测试的价值：
+它不是"验证能跑"，而是**把"六类状态缺一不可"变成一个可执行的断言**。
+
+配套的还有四条反证测试（在 `tests/test_checkpoint.py`），故意摘掉某一项再断言结果
+真的变了：摘掉 optimizer 状态 → 下一步参数就不同；摘掉 RNG → 第一步 loss 就不同；
+摘掉 loader 状态 → 第二个 epoch 的数据顺序就不同。**"必要"这件事得能证明，不能靠讲。**
+
+> 顺带一提：`evaluate()` 里 Dropout 是关的（`model.eval()`），所以验证阶段不消耗
+> RNG —— 这也是上面能逐位对齐的前提之一。
+
+### 三个文件的职责不一样
+
+| 文件 | 何时写 | 用途 |
+|------|-------|------|
+| `last.pt` | **每个 epoch 都写** | `--resume last` 的默认目标 |
+| `best.pt` | val 有提升时才写 | 最后在测试集上评一次分 |
+| `epoch{N}.pt` | `--save_every_epoch` 时 | 事后挑某一轮做对比 |
+
+有两个细节是刻意这么排的：
+
+- **早停判定放在落盘之后**。否则最后一轮的 `last.pt` 会缺一个 epoch，续训时从更早
+  的位置重来一遍，白算一轮。
+- **最终评测用哪个权重会打印出来**。正常用 `best.pt`；但如果是从别的 run 续训、
+  而这个 run 目录里从没轮到过 val 提升（`best_val_acc` 是从 checkpoint 带来的），
+  `best.pt` 可能压根不存在 —— 那就退回 `last.pt` 并**明确说明**，而不是静默换掉。
+  实测这条分支真的会被触发：合成数据上 val_acc 第 1 轮就到 1.0，续训两轮都没有
+  "刷新最优"。
+
+### 一个容易踩的语义坑：`--resume` 的同时把 `--epochs` 调大
+
+`total_steps = steps_per_epoch × epochs`，而 cosine / step 调度是按 `total_steps`
+规划整条曲线的。于是把 `--epochs` 从 2 改成 4 时，**整条 lr 曲线被重新规划**，
+连已经训过的那一轮都对不上 —— 第一次实测就撞上了：
+
+| | epoch 1 的 train_loss |
+|---|---|
+| `--epochs 2` 起步，续训到 4 | 0.6169 |
+| 一次跑完 `--epochs 4` | 0.6141 |
+
+这不是 bug，而是两件本来就不同的事：
+
+- **崩了重来**（`--epochs` 不变）→ 要求严格等价，本仓库做到了逐位一致；
+- **接着训到更多轮**（`--epochs` 变大）→ 重新规划 lr 曲线是**期望行为**，
+  这时候不该要求逐位等价。
+
+工具层面能做的是把它**打印出来**，而不是让用户对着曲线自己想：
+
+```
+ℹ️ --epochs 由 2 改成 4：「cosine」调度会按新的总步数（32）重新规划，
+   所以这条学习率曲线与「一次训到 4 轮」不可逐位对齐。
+   想要严格等价的断点恢复（比如崩了重来），--epochs 要和原来一样。
+```
+
+同类提醒还有一条：`--resume` 时如果关键超参和原实验不同（比如改了 `--lr`），
+会逐项打印差异。这是**最容易静默改变训练语义**的地方 —— 恢复 optimizer 状态之后，
+lr 调度器（它闭包住了 base_lr）还会用新配置的 lr 覆盖回去，于是"接着训"实际变成了
+"换学习率重新调度"，而 loss 曲线上看不出任何断点。`epochs` / `exp_name` /
+`output_dir` 这类"变了也正常"的键会被忽略，不刷屏。
+
+### 路径写错必须当场失败
+
+`--resume` 解析到的文件不存在时直接抛 `FileNotFoundError` 并打印**解析后的绝对路径**。
+
+这是续训最危险的失败模式：用户以为接上了，实际白训一遍，而 `summary.json` 里的
+loss 曲线看起来一切正常 —— 等发现时已经烧掉了几个小时。
+
 ## 核心代码位置（想学就看这几个文件）
 
 | 想学什么 | 看哪里 |
@@ -616,6 +775,7 @@ LR range test 的思路很朴素：**先用 100 步把这件事测出来，而�
 | 验证集为什么必须切 | `src/data.py` 的 `split_train_val()` |
 | **DDP 的进程组 / 数据切分 / 指标归约** | `src/distributed.py`（模块 docstring 列了三个必踩的坑） |
 | `torchrun` 不可用时怎么跑多进程 | `tools/ddp_launch.py`（FileStore rendezvous） |
+| **断点续训要恢复哪些状态** | `src/checkpoint.py`（模块 docstring 是一张"漏了会怎样"的表） |
 | **学习率该给多少** | `src/lr_finder.py`（模块 docstring 列了三个会让建议值静默出错的地方） |
 | `torch.compile` 在 Windows 上为什么用不了 | `src/compile_support.py` + `tools/compile_probe.py` |
 | 入口的编码保护为什么必须存在 | `src/console.py`（同一个坑踩过两次的记录） |
@@ -736,6 +896,29 @@ Decoupled weight decay——权重衰减不参与 Adam 的动量/二阶矩计算
 最后一条同样重要：扫完**必须把权重逐位还原** —— 扫描会把 lr 推到发散，
 不还原就是把 NaN 权重交给接下来的训练，而你会以为是"选的 lr 有问题"。
 
+**Q23: 断点续训要恢复哪些状态？漏了哪一个最难查？**
+六类：`optimizer.state_dict()`、`global_step`、`epoch`、`best_val_acc` + `patience_counter`、
+`scaler.state_dict()`、以及随机数状态（全局 torch RNG **和** DataLoader 的 shuffle generator）。
+**最难查的是 `best_val_acc` / `patience_counter`** —— 前者默认 0 会让 `best.pt` 被任何
+一个 epoch 覆盖，后者归零会让早停永远触发不了。它们都不报错、也不影响"能不能跑"，
+只是把**结果悄悄弄坏**：你会拿到一个明显更差的"最优权重"。
+`optimizer` 状态漏了则表现为"续训后 loss 先尖峰再回落"，很容易被归因成"断点处抖一下很正常"。
+
+**Q24: 为什么"只存随机数种子"不足以复现随机状态？**
+因为种子只决定**序列的起点**，而"已经走了多少步"这个信息只存在于状态里。
+还原种子 = 回到第 1 轮的 shuffle 顺序、第一轮 Dropout 的那批 mask。
+所以 `torch.get_rng_state()` / `generator.get_state()` 存的是**当前状态**而非种子。
+顺带一个坑：`DataLoader(shuffle=True)` 不带 generator 时，每轮会**从全局 RNG 现取一个
+种子**来建临时 generator —— 于是 Dropout 消耗多少随机数都会改变下一轮的数据顺序。
+两股流缠在一起，既说不清也没法单独还原，所以要给训练集的 DataLoader 显式传一个 generator。
+
+**Q25: 续训时把 `--epochs` 调大，还能和"一次训完"逐位一致吗？**
+不能，而且是**应该不能**。`total_steps = steps_per_epoch × epochs`，cosine / step 调度按
+`total_steps` 规划整条曲线 —— 把 epochs 从 2 改成 4，整条 lr 曲线被重新规划，
+连已经训过的那一轮都对不上。
+"崩了重来"（epochs 不变）要求严格等价，"接着训到更多轮"（epochs 变大）重新规划曲线才是
+期望行为。工具能做的是**把这个语义差打印出来**，而不是让用户对着曲线自己想。
+
 ## 后续可扩展
 
 - [x] `gradient checkpointing` 演示（用计算换显存的量化对比）
@@ -744,6 +927,13 @@ Decoupled weight decay——权重衰减不参与 Adam 的动量/二阶矩计算
       真正的加速对比需要 Linux —— 本机拿不到，所以没编数据）
 - [x] 学习率 finder（LR range test）：等比扫描 + 偏差修正 EMA + 权重零污染还原，
       实测 MNIST 上 100 步 16 秒、建议值 1.262e-3（与默认 lr 差 0.79×）
+- [x] 断点续训（`--resume last|best|<path>`）：六类状态 + 两股随机流全恢复，
+      实测「1 轮 + 续训 2 轮」与「连续 3 轮」权重**逐位一致**（0/18 个张量不同）
+- [ ] 分布式 checkpoint：只让 rank0 落盘、恢复时先 barrier；顺带把
+      `DistributedSampler` 的 `set_epoch` 与续训的交互补上（本仓库已是
+      `set_epoch(真实 epoch)`，天然正确，但缺一条测试）
+- [ ] 端到端的梯度/参数一致性测试：在 CI 上跑两遍小训练，比对 hash
+      （把"可复现"从"靠 seed"升级成"被验证"）
 
 ## License
 

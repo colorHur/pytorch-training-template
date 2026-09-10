@@ -193,9 +193,25 @@ def build_dataloaders(
 
     common = dict(num_workers=num_workers, pin_memory=pin_memory, drop_last=False)
     # 注意 drop_last 交给 sampler 控制（sampler.drop_last=True），DataLoader 保持 False
+
+    # ---- 训练集的 shuffle 随机流：显式给一个 Generator ----
+    # 为什么要显式给（而不是让 DataLoader(shuffle=True) 自己去全局 RNG 取种子）：
+    #   ① **解耦**。不给 generator 时，每轮 `__iter__` 会从全局 torch RNG 取一个
+    #      种子来建临时 generator —— 于是 Dropout 多抽一次都会改变下一轮的
+    #      数据顺序。两股随机流缠在一起，既说不清也没法单独复现。
+    #   ② **可续训**。显式 generator 之后，断点续训只要把 `loader.generator`
+    #      的状态存下来（见 `src/checkpoint.py`），就能精确恢复"下一轮该打乱成
+    #      什么样"，不依赖整个全局 RNG 都还原对。
+    #   ③ 多进程时不给（用 DistributedSampler，它的顺序由 seed + epoch 决定），
+    #      所以这里的 generator 是 None —— 与原先行为完全一致。
+    train_generator = None
+    if train_sampler is None:
+        train_generator = torch.Generator()
+        train_generator.manual_seed(seed)
+
     train_loader = DataLoader(
         train_set, batch_size=batch_size, shuffle=(train_sampler is None),
-        sampler=train_sampler, **common,
+        sampler=train_sampler, generator=train_generator, **common,
     )
     val_loader = DataLoader(
         val_set, batch_size=batch_size * 2, shuffle=False, sampler=val_sampler, **common
