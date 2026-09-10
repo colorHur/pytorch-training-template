@@ -411,3 +411,61 @@ def test_compile_never_breaks_training(tmp_path):
     assert "torch.compile：" in proc.stdout
     if not summary["torch_compile"]["active"]:
         assert "不可用" in proc.stdout or "失败" in proc.stdout
+
+
+# ============================================================
+# 学习率 finder：CLI 真的能端到端跑通
+# ============================================================
+def run_lr_finder(tmp_path: Path, *extra: str, env: dict | None = None):
+    """跑一次 `tools/lr_finder.py`，产物丢进 tmp_path。"""
+    out_dir = tmp_path / "lr"
+    cmd = [
+        sys.executable, str(ROOT / "tools" / "lr_finder.py"),
+        "--dataset", "synthetic",        # 离线，不下载
+        "--steps", "6",
+        "--output_dir", str(out_dir),
+        *extra,
+    ]
+    return (
+        subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            cwd=str(ROOT),
+            env={**os.environ, "CUDA_VISIBLE_DEVICES": "", **(env or {})},
+        ),
+        out_dir,
+    )
+
+
+def test_lr_finder_cli_runs_end_to_end(tmp_path):
+    """真跑一次 CLI，工件必须落盘、结论必须在日志里。
+
+    为什么值得专门跑：这是用户**第一个会用到的入口**（"lr 该给多少"），
+    也是重构时最容易悄悄弄坏的那个 —— 它一条链跨了数据、模型、优化器三块。
+    合成数据 + 6 步，几秒钟，不下载、不进 GPU。
+    """
+    proc, out_dir = run_lr_finder(tmp_path, "--batch_size", "64")
+    assert proc.returncode == 0, proc.stdout[-2500:] + proc.stderr[-2500:]
+
+    payload = json.loads((out_dir / "lr_sweep.json").read_text(encoding="utf-8"))
+    assert payload["steps"] == 6
+    assert 0 < len(payload["result"]["points"]) <= 6
+    assert payload["result"]["suggested_lr"] > 0
+    assert "建议 lr" in proc.stdout
+    assert (out_dir / "lr_sweep.md").exists()
+
+
+def test_lr_finder_cli_survives_non_utf8_stdout(tmp_path):
+    """和其它入口一样：cp1252 管道下中文日志不能把工具带崩。
+
+    （这个项目在这个坑上栽过两次，所以每个新入口都补一条。）
+    """
+    proc, _ = run_lr_finder(
+        tmp_path, "--steps", "4", env={"PYTHONIOENCODING": "cp1252"}
+    )
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    assert "UnicodeEncodeError" not in proc.stderr
+    assert "建议 lr" in proc.stdout

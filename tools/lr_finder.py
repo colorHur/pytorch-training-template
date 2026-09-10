@@ -59,7 +59,15 @@ OUT_DIR = HERE / "outputs" / "lr_finder"
 
 #: 这几个是**工具自己的**参数，不是 TrainConfig 的字段 ——
 #: 忘了剔除就会撞上 merge() 的「未知配置项」校验（main.py 的 --config 踩过同一个坑）。
-TOOL_ONLY_ARGS = {"config", "min_lr", "max_lr", "steps", "beta", "divergence_factor"}
+TOOL_ONLY_ARGS = {
+    "config",
+    "min_lr",
+    "max_lr",
+    "steps",
+    "beta",
+    "divergence_factor",
+    "output_dir",
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -97,6 +105,12 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=DEFAULT_DIVERGENCE_FACTOR,
         help="平滑 loss 超过历史最低点的多少倍就判为发散",
+    )
+    p.add_argument(
+        "--output_dir",
+        type=str,
+        default=None,
+        help="产物目录（默认 outputs/lr_finder，相对仓库根）",
     )
     return p.parse_args()
 
@@ -207,8 +221,11 @@ def main() -> int:
 
     print("\n" + result.describe(current_lr=cfg.lr))
 
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    json_path = OUT_DIR / "lr_sweep.json"
+    out_dir = Path(args.output_dir) if args.output_dir else OUT_DIR
+    if not out_dir.is_absolute():
+        out_dir = HERE / out_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    json_path = out_dir / "lr_sweep.json"
     json_path.write_text(
         json.dumps(
             {
@@ -228,7 +245,7 @@ def main() -> int:
         ),
         encoding="utf-8",
     )
-    md_path = OUT_DIR / "lr_sweep.md"
+    md_path = out_dir / "lr_sweep.md"
     md_path.write_text(
         build_report(result, cfg, image_size, len(loaders["train"])), encoding="utf-8"
     )

@@ -24,7 +24,7 @@
 | **checkpoint** | 保存最优权重 + 完整训练状态（含配置），支持早停 |
 | **分布式训练 (DDP)** | 同一份 `main.py` 单卡/多卡通用（`torchrun` 自动识别）；数据分片、梯度平均、指标归约、rank0 独占落盘；含不依赖 TCPStore 的启动器 |
 | **学习率 finder** | LR range test：训练前扫一遍 lr 报告该用多少；等比取点 + 偏差修正 EMA + 权重零污染还原，输出 ASCII 曲线 |
-| **测试 + CI** | 188 个 pytest 用例（CPU 可跑，多平台 CI）；离线合成数据集，秒级验证整条流水线 |
+| **测试 + CI** | 190 个 pytest 用例（CPU 可跑，多平台 CI）；离线合成数据集，秒级验证整条流水线 |
 
 ## 目录结构
 
@@ -114,7 +114,8 @@ python tools/lr_finder.py --config configs/mnist.yaml --lr 1e-3
 python tools/lr_finder.py --dataset synthetic --steps 40
 ```
 
-输出 `outputs/lr_finder/lr_sweep.md`（结论 + 曲线）与 `lr_sweep.json`（完整数据）。
+输出 `outputs/lr_finder/lr_sweep.md`（结论 + 曲线）与 `lr_sweep.json`（完整数据），
+产物目录可用 `--output_dir` 改。
 
 ### 4. 显存账对照实验
 
@@ -140,7 +141,7 @@ python experiments/exp_ddp_equivalence.py
 
 ```bash
 pip install -r requirements-dev.txt
-pytest                                    # 188 个用例，CPU 上约 2 分钟
+pytest                                    # 190 个用例，CPU 上约 2 分钟
 ruff check src experiments tests tools    # lint
 
 # 不想等下载？用内置的合成数据集跑通整条流水线
@@ -164,7 +165,7 @@ python tools/ddp_launch.py --nproc_per_node 2 -- src/main.py --dataset synthetic
 | `tests/test_distributed.py` | **DDP 梯度等价性（含 BN 反例）**、各 rank 切分不重不漏、`set_epoch` 真的换了顺序、`ctx=None` 判空约定 |
 | `tests/test_compile.py` | 平台探测（用 `platform_name` 让 Windows 分支在 Linux CI 上也能测）、冒烟不污染 BN、`unwrap_model` 剥嵌套包装、平台限制（canary） |
 | `tests/test_lr_finder.py` | 等比取点、**EMA 的偏差修正**、最陡下降选点、**扫描后权重逐位还原**、该关的开关都关了、结果可复现 |
-| `tests/test_smoke.py` | 真实 CLI 端到端跑通 + 产物落盘 + 命令行覆盖生效 + **非 UTF-8 输出编码下中文日志不崩** + 入口清单完整性 |
+| `tests/test_smoke.py` | 真实 CLI 端到端跑通（`src/main.py` 与 `tools/lr_finder.py`）+ 产物落盘 + 命令行覆盖生效 + **非 UTF-8 输出编码下中文日志不崩** + 入口清单完整性 |
 | `tests/test_ci_annotations.py` | 诊断通道本身：`_emit` 编码无关性、hook 触发与转义、端到端断言退出码是 1 而不是 3 |
 
 两条值得单独说的测试思路：
