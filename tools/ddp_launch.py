@@ -49,6 +49,14 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 
+# 挂的是 `src/` **目录**而不是包，于是 `import console` 直接命中
+# `src/console.py`，完全跳过 `src/__init__.py` —— 后者会连锁导入 torch，
+# 实测 `import src` 要 6.4 秒，对一个启动器来说太贵了。
+if str(ROOT / "src") not in sys.path:
+    sys.path.insert(0, str(ROOT / "src"))
+
+from console import force_utf8_stdout  # noqa: E402  （必须在 sys.path 之后）
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="用 FileStore 启动 DDP（Windows / 无 TCPStore 环境）")
@@ -65,6 +73,9 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    # 必须早于任何 print：CI 的 windows runner 用 cp1252 编码管道输出，
+    # 中文日志会直接抛 UnicodeEncodeError 把启动器带崩（踩过一次，见 src/console.py）。
+    force_utf8_stdout()
     args = parse_args()
 
     script_args = [a for a in args.script if a != "--"]

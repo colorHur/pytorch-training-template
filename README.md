@@ -23,7 +23,7 @@
 | **显存监控** | 每 epoch 打印当前/峰值显存 |
 | **checkpoint** | 保存最优权重 + 完整训练状态（含配置），支持早停 |
 | **分布式训练 (DDP)** | 同一份 `main.py` 单卡/多卡通用（`torchrun` 自动识别）；数据分片、梯度平均、指标归约、rank0 独占落盘；含不依赖 TCPStore 的启动器 |
-| **测试 + CI** | 110 个 pytest 用例（CPU 可跑，多平台 CI）；离线合成数据集，秒级验证整条流水线 |
+| **测试 + CI** | 129 个 pytest 用例（CPU 可跑，多平台 CI）；离线合成数据集，秒级验证整条流水线 |
 
 ## 目录结构
 
@@ -31,6 +31,7 @@
 pytorch-training-template/
 ├── src/
 │   ├── config.py      # 配置系统：dataclass + YAML + 命令行覆盖
+│   ├── console.py     # 零依赖的控制台工具（force_utf8_stdout）
 │   ├── data.py        # 数据加载：Dataset / DataLoader / transform + 分布式切分
 │   ├── model.py       # 模型定义 + 注册表（small_cnn / mlp）+ 梯度检查点
 │   ├── distributed.py # ⭐ DDP：进程组 / 数据切分 / 指标归约 / 模型包装
@@ -43,8 +44,9 @@ pytorch-training-template/
 │   ├── exp_checkpoint_granularity.py  # 梯度检查点单步拆解（显存 + 耗时）
 │   └── exp_ddp_equivalence.py         # DDP 等价性与吞吐实测
 ├── tools/
-│   └── ddp_launch.py  # 用 FileStore 启动 DDP（绕开 TCPStore，Windows 也能跑）
-├── tests/             # pytest：配置 / 数据 / 模型 / 训练循环 / 分布式 / 端到端
+│   ├── ddp_launch.py  # 用 FileStore 启动 DDP（绕开 TCPStore，Windows 也能跑）
+│   └── ddp_probe.py   # DDP 环境自检（能力门禁：环境不支持就明确 skip）
+├── tests/             # pytest：配置 / 数据 / 模型 / 训练循环 / 分布式 / 端到端 / CI 元测试
 ├── .github/workflows/ci.yml           # 多平台 CI：lint + 测试（CPU）
 ├── outputs/           # 训练产物（git 忽略）
 ├── pyproject.toml     # ruff 与 pytest 配置
@@ -118,7 +120,7 @@ python experiments/exp_ddp_equivalence.py
 
 ```bash
 pip install -r requirements-dev.txt
-pytest                                    # 110 个用例，CPU 上约 1.5 分钟
+pytest                                    # 129 个用例，CPU 上约 1.5 分钟
 ruff check src experiments tests tools    # lint
 
 # 不想等下载？用内置的合成数据集跑通整条流水线
@@ -193,6 +195,56 @@ python tools/ddp_launch.py --nproc_per_node 2 -- src/main.py --dataset synthetic
 
 > 这三条的共性是：**都不会在"跑一下试试"时暴露**。第 1 条要跑到 CPU 多进程才炸，
 > 第 2 条只在特定调用路径上炸，第 3 条最隐蔽 —— 它"看起来能跑"，只是结果悄悄错了。
+
+### 同一个坑踩了两次 —— 于是我把它变成了测试
+
+上面第 4 个 bug（中文日志在 cp1252 下崩）修完之后，我以为这事翻篇了。
+结果**加 DDP 时，新写的 `tools/ddp_launch.py` 又犯了同一个错**：它的 `main()`
+里直接 `print(f"[ddp_launch] 运行：...")`，没调 `force_utf8_stdout()`。
+同一个坑、不同的文件，中间只隔了一次提交。
+
+它一次带出三个症状：
+
+1. 两条 DDP 冒烟测试变红（它们都会去调这个启动器）；
+2. CI 的 windows job 连着红了 **四轮**，而我从外面只能看到一句
+   "Process completed with exit code 1" —— 因为 Actions 的日志接口要鉴权；
+3. **连累了我自己搭的排错通道**。为了绕过第 2 点，我加了个 pytest hook，把失败
+   提升成 check annotation（这个接口匿名可读）。结果这个 hook 用 `print()` 输出
+   含中文的 title，在**同一个 cp1252 环境**下抛 `UnicodeEncodeError` —— pytest
+   直接 INTERNALERROR，退出码从 1 变成 3。
+   **诊断工具自己成了新的故障源，比不做诊断更误导。**
+
+最后是「在本地重建 CI 的环境」破的局：
+
+```bash
+PYTHONIOENCODING=cp1252 CUDA_VISIBLE_DEVICES="" pytest tests/ -q
+```
+
+两条 DDP 测试立刻复现，真因一行就跳出来了。顺带解释了那个一直想不通的现象：
+在**纯 cp1252** 下 hook 崩掉是退出码 **3**，而 CI 上是 **1** —— 说明 CI 上
+hook 其实没崩，注解是被 GitHub **丢弃**的（原因是下面第三条）。
+
+**三条教训，都固化成了代码**：
+
+- **「下次记得」靠不住，把不变式写成测试**。现在
+  `test_entrypoint_pins_utf8_stdout` 会扫描**全部 6 个可执行入口**，少一个就红。
+  写这条测试时还发现第一版断言太松 —— 只查函数名，而
+  `from console import force_utf8_stdout` 这种「导入但没调用」也能骗过它，
+  于是收紧成必须出现**带括号的调用**。
+  顺带把实现从 `src/__init__.py` 挪进了零依赖的 `src/console.py`：`import src`
+  要 **6.4 秒**（连锁导入 torch），而 `tools/` 下的启动器不该为一行工具函数付这个代价。
+- **诊断通道自己也要有测试**。`tests/test_ci_annotations.py` 用 12 条用例从三层
+  守它：`_emit` 的编码无关性、hook 的触发条件与输出格式，以及一条**端到端**用例
+  真的在 cp1252 下起一个 pytest，断言退出码必须是 **1 而不是 3**。
+- **工作流命令的格式坑**：`::error file=...,title=...::message` 里的 `,` 和 `:`
+  必须转义成 `%2C` / `%3A`，`%` 要写成 `%25`，超长会被**静默丢弃**。
+  最容易踩的是 `title` —— 我往里塞了 nodeid，而 nodeid 长这样
+  `tests/test_x.py::test_y`，里面的 `::` 会把属性段直接截断，
+  于是**注解发得出去、却一条都显示不出来**。
+
+> 面试点：这类问题的价值不在"修了一个 bug"，而在**把一次性修复变成永久的不变式**。
+> 同一个坑出现第二次时，正确的动作不是再修一次，而是问"第一次修完为什么没防住第二次"——
+> 答案通常是：**修的是那个点，没修那类事**。
 
 ## 实测基准
 
@@ -387,6 +439,8 @@ run with USE_LIBUV=0 to disable it
 | 验证集为什么必须切 | `src/data.py` 的 `split_train_val()` |
 | **DDP 的进程组 / 数据切分 / 指标归约** | `src/distributed.py`（模块 docstring 列了三个必踩的坑） |
 | `torchrun` 不可用时怎么跑多进程 | `tools/ddp_launch.py`（FileStore rendezvous） |
+| 入口的编码保护为什么必须存在 | `src/console.py`（同一个坑踩过两次的记录） |
+| CI 的失败注解是怎么发的、坑在哪 | `tests/conftest.py` 的 `pytest_runtest_logreport()` |
 
 ## 关键概念速查（面试自测）
 

@@ -277,3 +277,68 @@ def test_ddp_checkpoint_has_no_module_prefix(tmp_path):
 
     model = build_model("small_cnn", in_channels=1, num_classes=10, image_size=28)
     model.load_state_dict(ckpt["model"])
+
+
+# ============================================================
+# 入口不变式：每个可执行入口都必须钉住 UTF-8 输出
+# ============================================================
+ENTRYPOINTS = [
+    "src/main.py",
+    "tools/ddp_launch.py",
+    "tools/ddp_probe.py",
+    "experiments/exp_memory_accounting.py",
+    "experiments/exp_checkpoint_granularity.py",
+    "experiments/exp_ddp_equivalence.py",
+]
+
+
+@pytest.mark.parametrize("rel", ENTRYPOINTS)
+def test_entrypoint_pins_utf8_stdout(rel):
+    """每个可执行入口都必须在最早期调 `force_utf8_stdout()`。
+
+    这个坑在本仓库**踩过两次**：先是 `src/main.py`（CI 的 windows runner 上
+    整个训练带 exit code 1 崩掉），修完没多久，新写的 `tools/ddp_launch.py`
+    又犯了同一个错 —— 换个文件、换个 print 语句而已。那次两条 DDP 冒烟测试
+    一起红，还连累 CI 的排错通道（同样的 cp1252 环境把注解 hook 也搞崩了，
+    现象退化成一句 "Process completed with exit code 1"）。
+
+    两次的症状完全一样：**本地怎么跑都是绿的，只有 CI 的 windows runner 红**，
+    因为本地中文 locale（cp936）能正常编码中文，而 CI 是 cp1252。
+    结论是「下次记得改」靠不住，所以把不变式钉成测试，漏一个入口就红。
+
+    这里只做源码级检查（函数名不会变，变了这条测试也会跟着红）；行为级验证
+    由 `test_ddp_launcher_survives_non_utf8_stdout` 和
+    `test_chinese_log_survives_non_utf8_stdout` 负责。
+    """
+    text = (ROOT / rel).read_text(encoding="utf-8")
+    assert '__name__ == "__main__"' in text, f"{rel} 看起来不是可执行入口"
+    # 断言带括号的**调用**而不是函数名 —— 只写 `from console import
+    # force_utf8_stdout` 是没用的（第一版断言就被这个骗过了，摘掉调用仍然绿）
+    assert "force_utf8_stdout()" in text, (
+        f"{rel} 没有把 stdout 钉成 UTF-8 —— 在英文 Windows / CI 管道里，"
+        f"任何一句中文 print 都会抛 UnicodeEncodeError 把进程带崩"
+    )
+
+
+def test_ddp_launcher_survives_non_utf8_stdout():
+    """`tools/ddp_launch.py` 自己在 cp1252 管道下也不能崩。
+
+    这是上面那条不变式的**行为级**版本，来自一次真实回归：启动器里的
+    `print(f"[ddp_launch] 运行：...")` 在 CI 的 windows runner 上抛
+    UnicodeEncodeError 并 exit 1，两条 DDP 测试因此一起变红。
+
+    不给参数调用会走"用法提示"分支：打印一段中文并返回 2。
+    返回码 2 是正常的参数提示，**不是**崩溃。
+    """
+    proc = subprocess.run(
+        [sys.executable, str(ROOT / "tools" / "ddp_launch.py")],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        cwd=str(ROOT),
+        env={**os.environ, "PYTHONIOENCODING": "cp1252"},
+        timeout=120,
+    )
+    assert proc.returncode == 2, (
+        f"启动器在非 UTF-8 编码下崩了\n{proc.stdout[-1500:]}\n{proc.stderr[-1500:]}"
+    )
+    assert "UnicodeEncodeError" not in proc.stderr
+    assert "用法" in proc.stdout            # 中文确实完整写出来了

@@ -34,6 +34,10 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(HERE))
+# 挂 src/ 目录（不是包），零依赖拿到 force_utf8_stdout —— 见 src/console.py
+sys.path.insert(0, str(HERE / "src"))
+
+from console import force_utf8_stdout  # noqa: E402
 
 OUT_DIR = HERE / "outputs" / "exp_ckpt_granularity"
 MODES = ["none", "per_block", "whole"]
@@ -302,4 +306,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    force_utf8_stdout()   # 必须早于任何 print（cp1252 管道下中文会崩）
     main()
