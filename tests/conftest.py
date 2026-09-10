@@ -52,8 +52,16 @@ def pytest_runtest_logreport(report) -> None:
     payload = _annotation_payload(report)
     if not payload:
         return
+
+    # `file=` 是必需的：实测不带文件归属的 ::error:: 不会出现在 check-run 的
+    # annotations 接口里（runner 自己那条「Process completed with exit code 1」
+    # 是带 file/line 的）。归属到真实出错的测试文件，比挂到 conftest 上更有用。
+    path, _, _ = report.nodeid.partition("::")
     nodeid = report.nodeid.replace("\n", " ")
     # 开头的换行是必需的：pytest 的进度字符（-q 下的 F）会顶在这一行前面，
     # 而 GitHub 只解析**行首**的工作流命令 —— 不换行就等于没发。
     # 换行会让 GitHub 只取第一行，所以 payload 里也要压成单行。
-    print(f"\n::error title=pytest 失败 {nodeid}::{payload}", flush=True)
+    print(
+        f'\n::error file={path},line=1,title=pytest 失败 {nodeid}::{payload}',
+        flush=True,
+    )
