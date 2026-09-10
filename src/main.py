@@ -64,6 +64,18 @@ def gpu_mem_str() -> str:
     return f"cur {cur:.2f}GB / peak {peak:.2f}GB"
 
 
+def gpu_name() -> str | None:
+    """当前 GPU 名字；取不到就返回 None（容器里可能驱动可见但无设备）。"""
+    if not torch.cuda.is_available():
+        return None
+    try:
+        if torch.cuda.device_count() > 0:
+            return torch.cuda.get_device_name(0)
+    except Exception:
+        return None
+    return None
+
+
 def save_checkpoint(path: Path, model, optimizer, epoch, global_step, cfg, metrics) -> None:
     """保存 checkpoint。
 
@@ -117,7 +129,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--exp_name", type=str, default=None)
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--output_dir", type=str, default=None)
-    p.add_argument("--dataset", type=str, default=None, choices=["mnist", "cifar10"])
+    p.add_argument(
+        "--dataset", type=str, default=None, choices=["mnist", "cifar10", "synthetic"]
+    )
     p.add_argument("--data_dir", type=str, default=None)
     p.add_argument("--num_workers", type=int, default=None)
     p.add_argument("--val_ratio", type=float, default=None)
@@ -155,12 +169,20 @@ def main() -> None:
     # 注意：`--config` 是运行参数，不是配置项，必须从覆盖集合里剔除
     overrides = {k: v for k, v in vars(args).items() if k != "config"}
     cfg = TrainConfig.from_yaml(args.config) if args.config else TrainConfig()
+
+    # AMP + CPU 的冲突要在这里先化解：TrainConfig 的校验会直接抛 ValueError，
+    # 但用户只是想要个提醒，不该看到一坨 traceback。
+    amp_downgraded = False
+    if overrides.get("amp") and (overrides.get("device") or cfg.device) == "cpu":
+        overrides["amp"] = False
+        amp_downgraded = True
+
     cfg = cfg.merge(**overrides)
     device = cfg.resolve_device()
 
     if cfg.amp and device == "cpu":
-        print("⚠️  指定了 --amp 但设备是 CPU，已自动关闭混合精度")
         cfg = cfg.merge(amp=False)
+        amp_downgraded = True
 
     set_seed(cfg.seed)
 
@@ -178,8 +200,10 @@ def main() -> None:
 
     log(f"\n{'=' * 60}\n  PyTorch 训练模板 · {cfg.exp_name}\n{'=' * 60}")
     log(cfg.summary())
-    log(f"  设备: {device}" + (f" ({torch.cuda.get_device_name(0)})" if device == "cuda" else ""))
+    log(f"  设备: {device}" + (f" ({gpu_name()})" if device == "cuda" and gpu_name() else ""))
     log(f"  输出目录: {run_dir}\n")
+    if amp_downgraded:
+        log("⚠️  指定了 AMP 但设备是 CPU，已自动关闭混合精度\n")
 
     # ---- 数据 ----
     log("[1/5] 加载数据...")
@@ -194,6 +218,8 @@ def main() -> None:
     )
     meta = loaders["meta"]
     cfg = cfg.merge(num_classes=meta["num_classes"], in_channels=meta["in_channels"])
+    # image_size 是数据集属性而非超参，不进配置，直接从 meta 取
+    image_size = meta.get("image_size", 28)
     log(
         f"      train {len(loaders['train'].dataset)} 张 | "
         f"val {len(loaders['val'].dataset)} 张 | test {len(loaders['test'].dataset)} 张 "
@@ -203,7 +229,10 @@ def main() -> None:
     # ---- 模型 ----
     log("[2/5] 建模型...")
     model = build_model(
-        cfg.model, in_channels=cfg.in_channels, num_classes=cfg.num_classes
+        cfg.model,
+        in_channels=cfg.in_channels,
+        num_classes=cfg.num_classes,
+        image_size=image_size,
     ).to(device)
 
     if cfg.channels_last:
@@ -219,7 +248,7 @@ def main() -> None:
             log(f"      ⚠️  {cfg.model} 未实现梯度检查点，该配置已忽略")
 
     total, trainable = count_parameters(model)
-    log(f"      {cfg.model}: 总参数 {total:,} / 可训练 {trainable:,}")
+    log(f"      {cfg.model}: 总参数 {total:,} / 可训练 {trainable:,}（输入 {image_size}×{image_size}）")
 
     # ---- 优化器 / 调度器 / 损失 ----
     optimizer = build_optimizer(model, cfg)
@@ -304,7 +333,7 @@ def main() -> None:
     train_time = time.time() - t_train
 
     # ---- 测试集最终评测（只跑一次）----
-    log(f"\n[5/5] 用最优权重在测试集上评测...")
+    log("\n[5/5] 用最优权重在测试集上评测...")
     ckpt = torch.load(best_path, map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model"])
     test_stats = evaluate(model, loaders["test"], criterion, device)
@@ -315,7 +344,7 @@ def main() -> None:
         "exp_name": cfg.exp_name,
         "config": cfg.to_dict(),
         "device": device,
-        "gpu": torch.cuda.get_device_name(0) if device == "cuda" else None,
+        "gpu": gpu_name(),
         "total_params": total,
         "trainable_params": trainable,
         "gradient_checkpointing_active": ckpt_active,
@@ -333,7 +362,7 @@ def main() -> None:
     cfg.to_yaml(run_dir / "config_resolved.yaml")
 
     log(f"\n{'=' * 60}")
-    log(f"  训练完成")
+    log("  训练完成")
     log(f"  最优验证准确率 : {best_val_acc:.4f}")
     log(f"  测试集准确率   : {test_stats['acc']:.4f}")
     log(f"  总耗时         : {train_time:.1f}s")

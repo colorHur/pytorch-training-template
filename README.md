@@ -1,5 +1,7 @@
 # PyTorch 训练模板
 
+[![CI](https://github.com/colorHur/pytorch-training-template/actions/workflows/ci.yml/badge.svg)](https://github.com/colorHur/pytorch-training-template/actions/workflows/ci.yml)
+
 一套**手写、不含高层封装**的 PyTorch 训练脚手架。目的是把训练循环的每个细节讲清楚——而不是调一个 `Trainer` 就完事。
 
 > 为什么手写？面试问的是 `optimizer.zero_grad()` 为什么必须在 `backward()` 之前、梯度累积怎么省显存、`GradScaler` 解决什么问题、梯度检查点省的是哪部分显存。这些被封装的 API 挡住了。
@@ -20,6 +22,7 @@
 | **梯度裁剪** | 按全局 L2 范数裁剪，防梯度爆炸 |
 | **显存监控** | 每 epoch 打印当前/峰值显存 |
 | **checkpoint** | 保存最优权重 + 完整训练状态（含配置），支持早停 |
+| **测试 + CI** | 78 个 pytest 用例（CPU 可跑，多平台 CI）；离线合成数据集，秒级验证整条流水线 |
 
 ## 目录结构
 
@@ -36,8 +39,12 @@ pytorch-training-template/
 ├── experiments/
 │   ├── exp_memory_accounting.py       # 显存账对照实验（7 个变体）
 │   └── exp_checkpoint_granularity.py  # 梯度检查点单步拆解（显存 + 耗时）
+├── tests/             # pytest：配置 / 数据 / 模型 / 训练循环 / 端到端
+├── .github/workflows/ci.yml           # 多平台 CI：lint + 测试（CPU）
 ├── outputs/           # 训练产物（git 忽略）
-└── requirements.txt
+├── pyproject.toml     # ruff 与 pytest 配置
+├── requirements.txt       # 运行时依赖
+└── requirements-dev.txt   # 开发/测试依赖（CI 用）
 ```
 
 ## 快速开始
@@ -93,6 +100,50 @@ python experiments/exp_checkpoint_granularity.py
 ```
 
 输出 `outputs/exp_memory/memory_accounting.md` 与 `outputs/exp_ckpt_granularity/checkpoint_granularity.md`。
+
+### 4. 跑测试
+
+```bash
+pip install -r requirements-dev.txt
+pytest                                    # 78 个用例，CPU 上约 1 分钟
+ruff check src experiments tests          # lint
+
+# 不想等下载？用内置的合成数据集跑通整条流水线
+python src/main.py --dataset synthetic --epochs 1
+```
+
+测试**不需要 GPU、不需要下载任何数据**（内置 `--dataset synthetic` 离线合成数据集），
+任何机器上都能跑 —— CI 就是这么跑的。
+
+## 测试覆盖什么
+
+| 文件 | 覆盖 |
+|------|------|
+| `tests/test_config.py` | 三级配置优先级、参数校验、YAML 往返 |
+| `tests/test_data.py` | 验证集切分无重叠、meta 与模型匹配、合成数据真的可分 |
+| `tests/test_model.py` | 输入尺寸推算、参数量、**检查点不改变梯度**、BN 双倍更新（canary） |
+| `tests/test_train.py` | LR 调度取值、**更新次数 = ⌈批次数 / 累积步数⌉**、`no_grad` 生效、loss 真的会降 |
+| `tests/test_smoke.py` | 真实 CLI 端到端跑通 + 产物落盘 + 命令行覆盖生效 |
+
+两条值得单独说的测试思路：
+
+- **合成数据集必须"可学习"**。如果造出来的假数据连最近邻都分不开，"loss 下降"这类断言就没有意义 ——
+  所以专门有一条测试验证它类间可分（最近邻准确率 > 0.9）。
+- **BN 双倍更新写成 canary 测试**。它断言的是**现状**而非"正确行为"，这是故意的：
+  上游哪天修好了，测试会告警，提醒把 README 一起改掉，而不是让文档悄悄过时。
+
+### 写测试当场抓到的三个真 bug
+
+这轮加测试不是走过场，跑起来立刻暴露了三个问题：
+
+1. **`small_cnn` 的全连接层输入维度写死 7×7** → `--dataset cifar10`（32×32 池化两次是 8×8）
+   会直接 shape mismatch 崩掉。README 一直宣称支持 CIFAR-10，实际跑不通。
+   已改为按 `image_size` 推算。
+2. **`resolve_device()` 只看 `torch.cuda.is_available()`** → 容器 / CI 里"驱动可见但没暴露设备"
+   时（`is_available()` 返回 True 而 `device_count()` 是 0）会误判成 cuda，
+   随后 `get_device_name(0)` 抛 `Invalid device id`。已改为两个条件都查，且探测异常时退回 CPU。
+3. **`--amp --device cpu` 会抛异常**，而不是走那段"优雅关闭混合精度"的提示 ——
+   因为 config 的校验在合并配置时就先炸了，提示代码根本不可达。已改为预先化解冲突。
 
 ## 实测基准
 

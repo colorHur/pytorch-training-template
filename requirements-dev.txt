@@ -1,0 +1,12 @@
+# 开发 / 测试依赖（CI 用这个）
+#
+# 装法：
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+#   pip install -r requirements-dev.txt
+#
+# 先装 CPU 版 torch 再装这个 —— 否则 pip 会按 requirements.txt 的约束
+# 去 PyPI 拉一个可能和本地 CUDA 不匹配的 build。
+-r requirements.txt
+
+pytest>=8.0
+ruff>=0.6

@@ -232,7 +232,7 @@ def build_report(rows: list[dict], batch_size: int, iters: int) -> str:
         f"{abs(round(100 * (per_block['retained_after_fwd_mb'] / none['retained_after_fwd_mb']) - 100))}%，",
         f"> 前向峰值从 {none['forward_peak_mb']:.0f}MB 降到 {per_block['forward_peak_mb']:.0f}MB。",
         "> 但它不改变训练全程峰值：反向时重算会把激活重新物化，卷积反向的 workspace 也照付，",
-        f"> 所以整体峰值我只降了十几百分点。**判据是激活值占总显存的比例，不是模型大小。**",
+        "> 所以整体峰值我只降了十几百分点。**判据是激活值占总显存的比例，不是模型大小。**",
         ">",
         "> 粒度也有讲究 —— 我把整条主干当成一个检查点段试过，收益直接归零",
         f">（{whole['total_peak_mb']:.0f}MB vs {none['total_peak_mb']:.0f}MB），",

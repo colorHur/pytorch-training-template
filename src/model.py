@@ -49,7 +49,11 @@ def _conv_block(in_channels: int, out_channels: int) -> nn.Sequential:
 
 
 class SmallCNN(nn.Module):
-    """适合 MNIST / CIFAR-10 的小型卷积网络（支持梯度检查点）。"""
+    """适合 MNIST / CIFAR-10 的小型卷积网络（支持梯度检查点）。
+
+    ⚠️ `image_size` 必须和数据集匹配：卷积主干池化两次 → 特征图是 `image_size // 4`，
+    全连接层的输入维度由它算出来。写死 7*7 的话 CIFAR-10（32×32 → 8×8）会 shape mismatch。
+    """
 
     def __init__(
         self,
@@ -57,6 +61,7 @@ class SmallCNN(nn.Module):
         num_classes: int = 10,
         dropout: float = 0.25,
         gradient_checkpointing: bool = False,
+        image_size: int = 28,
     ):
         super().__init__()
         # 输入假设为 28x28（MNIST）；CIFAR-10 是 32x32，池化两次后是 8x8
@@ -64,10 +69,11 @@ class SmallCNN(nn.Module):
             _conv_block(in_channels, 32),          # 28 -> 14
             _conv_block(32, 64),                   # 14 -> 7
         )
+        feat = image_size // 4                     # 两次 MaxPool2d(2) 后的空间尺寸
         self.classifier = nn.Sequential(
             nn.Flatten(),
             nn.Dropout(dropout),
-            nn.Linear(64 * 7 * 7, 128),
+            nn.Linear(64 * feat * feat, 128),
             nn.ReLU(inplace=True),
             nn.Linear(128, num_classes),
         )
@@ -135,13 +141,22 @@ class SmallCNN(nn.Module):
 
 
 class MLP(nn.Module):
-    """纯全连接对照模型：用来演示「没有卷积也能训」，以及参数量的差异。"""
+    """纯全连接对照模型：用来演示「没有卷积也能训」，以及参数量的差异。
 
-    def __init__(self, in_channels: int = 1, num_classes: int = 10, hidden: int = 256):
+    同样按 `image_size` 推算输入维度，理由见 SmallCNN 的说明。
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 1,
+        num_classes: int = 10,
+        hidden: int = 256,
+        image_size: int = 28,
+    ):
         super().__init__()
         self.net = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(in_channels * 28 * 28, hidden),
+            nn.Linear(in_channels * image_size * image_size, hidden),
             nn.ReLU(inplace=True),
             nn.Dropout(0.2),
             nn.Linear(hidden, num_classes),

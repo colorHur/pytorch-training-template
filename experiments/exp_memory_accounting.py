@@ -161,8 +161,6 @@ def build_report(results: list[dict], scaling: list[dict], epochs: int) -> str:
     def ratio(r: dict) -> str:
         return f"{r['peak_vram_gb'] / base_vram:.2f}×"
 
-    # 检查点的真实代价：只有 D 与 E 开了检查点
-    ckpt_overhead = 100 * (d["train_time_sec"] / a["train_time_sec"]) - 100
     # BN 统计量被双倍更新带来的实际精度偏移（A 与 D 除检查点外完全同参同 seed）
     acc_delta = (d["test_acc"] - a["test_acc"]) * 100
 
@@ -216,7 +214,7 @@ def build_report(results: list[dict], scaling: list[dict], epochs: int) -> str:
         f"准确率 {c['test_acc']:.4f}，不低于基准。",
         "",
         f"3. **梯度检查点（D）**：峰值 {d['peak_vram_gb']:.3f} GB，降 {drop(d)}。",
-        f"   收益来源与累积/AMP 不同：后两者是**少存**激活，检查点是**不存**块内激活、",
+        "   收益来源与累积/AMP 不同：后两者是**少存**激活，检查点是**不存**块内激活、",
         "   反向时按 block 粒度重算一遍。所以它的上限最高（理论上能把块内激活全砍掉），",
         "   代价也最贵（多一次前向）。",
         "",
@@ -335,7 +333,7 @@ def build_report(results: list[dict], scaling: list[dict], epochs: int) -> str:
         "> 都上完还不够才用**梯度检查点** —— 不保存块内激活、反向重算，代价是多一次前向。",
         f"> 三种可以叠加，组合下来峰值只有基准的 {ratio(e)}。",
         ">",
-        f"> 检查点我做了个拆解：它砍的是**前向保活的激活**，实测能砍掉 80%+、前向峰值腰斩，",
+        "> 检查点我做了个拆解：它砍的是**前向保活的激活**，实测能砍掉 80%+、前向峰值腰斩，",
         "> 但训练全程峰值由反向决定 —— 重算会把激活重新物化，卷积反向的 workspace 也照付。",
         f"> 所以 batch=256 时整体只降 {drop(d)}，batch 放大到 1024 就降 "
         f"{100 * (1 - g['peak_vram_gb'] / big_vram):.0f}%。",

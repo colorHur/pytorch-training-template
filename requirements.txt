@@ -1,11 +1,15 @@
-# PyTorch 训练模板 · 实测依赖版本（2026-09-10）
-# 注意：torch 需按 CUDA 版本从专用源安装，见 README
-torch==2.11.0+cu128
-torchvision==0.26.0+cu128
+# PyTorch 训练模板 · 运行时依赖
+#
+# ⚠️ torch / torchvision 需要按你的 CUDA 版本从专用源安装（见 README），
+#    所以这里只给宽松约束，**不写死 +cu128** —— 写死了在没有 CUDA 的机器上
+#    （CI、纯 CPU 环境）根本找不到对应的 wheel，装不上。
+#    本仓库的实测快照：torch 2.11.0+cu128 / torchvision 0.26.0+cu128
+torch>=2.0
+torchvision>=0.15
 
-# 配置与实验管理
+# 配置
 pyyaml>=6.0
 
-# 数据集下载（torchvision 依赖，显式列出以固定版本）
+# 数据（torchvision 的依赖，显式列出以固定下限）
 numpy>=1.26
 pillow>=10.0

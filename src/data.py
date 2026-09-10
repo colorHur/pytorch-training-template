@@ -26,15 +26,59 @@ from torch.utils.data import DataLoader, Dataset, random_split
 from torchvision import datasets, transforms
 
 # ---- 各数据集的归一化统计量 ----
+# image_size 供模型推算全连接层输入维度（池化两次 → image_size // 4）
 DATASET_STATS = {
-    "mnist": {"mean": (0.1307,), "std": (0.3081,), "in_channels": 1, "num_classes": 10},
+    "mnist": {
+        "mean": (0.1307,), "std": (0.3081,),
+        "in_channels": 1, "num_classes": 10, "image_size": 28,
+    },
     "cifar10": {
         "mean": (0.4914, 0.4822, 0.4465),
         "std": (0.2470, 0.2435, 0.2616),
-        "in_channels": 3,
-        "num_classes": 10,
+        "in_channels": 3, "num_classes": 10, "image_size": 32,
+    },
+    # synthetic 不需要归一化统计量（数据本身就是人造的），列在这里只为对齐 meta 结构
+    "synthetic": {
+        "mean": (0.0,), "std": (1.0,),
+        "in_channels": 1, "num_classes": 10, "image_size": 28,
     },
 }
+
+
+# ============================================================
+# 合成数据集：不下载任何东西
+# ============================================================
+def _synthetic_tensor(n: int, seed: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """造一批**可学习**的假数据。
+
+    规则：每类 c 在通道 0 的第 (6 + 2c) 行放一条亮带，其余是噪声。
+    为什么要可学习？—— 只有模型能真的把它学好，才能写出
+    「训练 N 步后 loss 明显下降」这种断言。纯随机标签是学不会的，
+    那样的测试只能验证"没崩"，验证不了"训对了"。
+    """
+    g = torch.Generator().manual_seed(seed)
+    y = torch.randint(0, 10, (n,), generator=g)
+    x = 0.1 * torch.randn(n, 1, 28, 28, generator=g)
+    for c in range(10):
+        x[y == c, 0, 6 + 2 * c, 6:22] += 2.0
+    return x, y
+
+
+class SyntheticDataset(Dataset):
+    """离线合成数据集：用于单元测试、CI 和"两秒钟验证训练循环能跑"。
+
+    真实项目里也需要这种东西 —— 调训练循环时不该每次都等数据集下载和加载。
+    """
+
+    def __init__(self, n: int = 1000, train: bool = True):
+        # 训练/测试用不同 seed，避免"测试集是训练集子集"这种假象
+        self.x, self.y = _synthetic_tensor(n, seed=0 if train else 10_000)
+
+    def __len__(self) -> int:
+        return len(self.y)
+
+    def __getitem__(self, index: int):
+        return self.x[index], self.y[index]
 
 
 class IndexedDataset(Dataset):
@@ -76,9 +120,15 @@ def build_transforms(dataset_name: str, train: bool) -> Callable:
 
 
 def build_datasets(dataset_name: str, data_dir: str = "data"):
-    """返回 (train_set, val_set, test_set)。"""
+    """返回 (train_full, test_set)。
+
+    `synthetic` 走本地合成数据，不下载、不需要网络 —— 单元测试与 CI 用这个。
+    """
     if dataset_name not in DATASET_STATS:
         raise KeyError(f"未知数据集 '{dataset_name}'，可选：{sorted(DATASET_STATS)}")
+
+    if dataset_name == "synthetic":
+        return SyntheticDataset(n=1000, train=True), SyntheticDataset(n=500, train=False)
 
     builder = {"mnist": datasets.MNIST, "cifar10": datasets.CIFAR10}[dataset_name]
     train_full = builder(

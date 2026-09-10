@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 import dataclasses
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -33,7 +33,7 @@ class TrainConfig:
     output_dir: str = "outputs"
 
     # ---- 数据 ----
-    dataset: str = "mnist"           # mnist / cifar10
+    dataset: str = "mnist"           # mnist / cifar10 / synthetic
     data_dir: str = "data"
     num_workers: int = 0             # Windows 下建议 0，避免多进程开销
     val_ratio: float = 0.1           # 从训练集切出的验证集比例
@@ -86,14 +86,26 @@ class TrainConfig:
         return self.batch_size * self.grad_accum_steps
 
     def resolve_device(self) -> str:
-        """把 'auto' 解析成实际设备。"""
+        """把 'auto' 解析成实际设备。
+
+        ⚠️ 不能只看 `torch.cuda.is_available()`：
+        在容器 / CI 里（例如 `CUDA_VISIBLE_DEVICES=""`）驱动可见但**没有暴露任何设备**，
+        此时 `is_available()` 仍返回 True 而 `device_count()` 是 0，
+        后面一旦调用 `get_device_name(0)` 就会炸 "Invalid device id"。
+        所以两个条件都要查。
+        """
         if self.device != "auto":
             return self.device
         try:
             import torch
-
-            return "cuda" if torch.cuda.is_available() else "cpu"
         except ImportError:
+            return "cpu"
+        try:
+            if not torch.cuda.is_available():
+                return "cpu"
+            return "cuda" if torch.cuda.device_count() > 0 else "cpu"
+        except Exception:
+            # 驱动层面的任何异常都退回 CPU，不要因为探测失败就崩掉整个训练
             return "cpu"
 
     # ---------- 序列化 ----------
