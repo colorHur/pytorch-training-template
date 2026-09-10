@@ -6,12 +6,14 @@
 
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 
 import pytest
 
 from src.config import TrainConfig
 from src.data import DATASET_STATS
+from src.main import RUN_ONLY_ARGS, build_parser
 
 CONFIGS = Path(__file__).resolve().parent.parent / "configs"
 
@@ -106,3 +108,54 @@ def test_summary_mentions_effective_batch():
     text = TrainConfig(batch_size=32, grad_accum_steps=2).summary()
     assert "等效 batch size" in text
     assert "64" in text
+
+
+# ============================================================
+# 命令行开关的完整性（「配置里有、命令行够不着」这件事要防住）
+# ============================================================
+# 这两个字段**故意**不暴露在命令行：它们会被 `--dataset` 对应的元信息自动覆盖
+# （main.py / tools/lr_finder.py 里都有一行 `cfg.merge(num_classes=..., in_channels=...)`）。
+# 放出来只会更糟 —— 用户写 `--num_classes 5` 会被静默盖掉，还以为生效了。
+AUTO_DERIVED = {"num_classes", "in_channels"}
+
+
+def test_every_config_field_is_reachable_from_the_cli():
+    """配置里的每个字段都必须有一个对应的命令行开关。
+
+    这条不变式守的是一个**真实发生过两次**的坑：`save_every_epoch` 和 `momentum`
+    都在 `TrainConfig` 里有、命令行上却没有 —— 结果「能选 SGD 但不能调它的动量」。
+    人眼对账一定会在某个版本漂掉，所以交给测试。
+    """
+    options = {opt for action in build_parser()._actions for opt in action.option_strings}
+    missing = [
+        field.name
+        for field in dataclasses.fields(TrainConfig)
+        if field.name not in AUTO_DERIVED and f"--{field.name}" not in options
+    ]
+    assert not missing, f"这些配置项没有命令行开关：{missing}"
+
+
+def test_no_cli_flag_is_unknown_to_the_config():
+    """反向：命令行上的每个开关都必须是合法配置项。
+
+    否则 `cfg.merge(**overrides)` 会抛 `ValueError: 未知配置项` —— 用户看到的是
+    配置系统的报错，而真正的原因是他敲的那个开关根本没人在管。
+    """
+    fields = {field.name for field in dataclasses.fields(TrainConfig)}
+    unknown = [
+        action.dest
+        for action in build_parser()._actions
+        if action.dest != "help" and action.dest not in fields | RUN_ONLY_ARGS
+    ]
+    assert not unknown, f"这些命令行开关不在 TrainConfig 里：{unknown}"
+
+
+def test_auto_derived_fields_are_not_meant_to_be_set_by_hand():
+    """`AUTO_DERIVED` 不是随手加的免责名单 —— 它必须真的被覆盖掉。
+
+    如果哪天有人把 `cfg.merge(num_classes=...)` 删了，这两个字段就会退回
+    YAML 里的值，而 `--dataset cifar10`（3 通道）配 `in_channels: 1`（YAML）
+    会在建模型时炸掉，或者更糟：不炸但通道数错了。
+    """
+    for name in AUTO_DERIVED:
+        assert name in {field.name for field in dataclasses.fields(TrainConfig)}

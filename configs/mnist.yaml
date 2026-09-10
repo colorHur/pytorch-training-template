@@ -10,6 +10,9 @@ num_workers: 0
 val_ratio: 0.1
 
 model: small_cnn
+# ⚠️ 下面两行**不会生效**：它们由 `--dataset` 对应的元信息自动覆盖
+#    （src/main.py: cfg.merge(num_classes=meta["num_classes"], in_channels=...)。
+#    写在这里只是留个说明，改 `--dataset cifar10` 时通道数会自动变成 3。）
 num_classes: 10
 in_channels: 1
 

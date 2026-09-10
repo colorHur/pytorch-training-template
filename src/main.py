@@ -95,7 +95,13 @@ def gpu_name() -> str | None:
     return None
 
 
-def parse_args() -> argparse.Namespace:
+def build_parser() -> argparse.ArgumentParser:
+    """把 parser 单独造出来，是为了能被测试直接摸到。
+
+    只有把 `--xxx` 列表拿到手里，测试才能断言「`TrainConfig` 的每个字段
+    都有一个对应的命令行开关」—— 否则漏一个字段（比如 `momentum`）只能靠人眼对账，
+    而人眼对账一定会漂。
+    """
     p = argparse.ArgumentParser(description="PyTorch 训练模板")
     p.add_argument("--config", type=str, default=None, help="YAML 配置文件路径")
     p.add_argument(
@@ -123,6 +129,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr", type=float, default=None)
     p.add_argument("--weight_decay", type=float, default=None)
     p.add_argument("--optimizer", type=str, default=None, choices=["adamw", "sgd"])
+    p.add_argument(
+        "--momentum",
+        type=float,
+        default=None,
+        help="SGD 的动量（仅 --optimizer sgd 生效）。默认 0.9，但调它常常有用："
+        "动量太大会在后期震荡，太小则收敛慢。",
+    )
     p.add_argument("--lr_scheduler", type=str, default=None, choices=["none", "cosine", "step"])
     p.add_argument("--warmup_steps", type=int, default=None)
     p.add_argument("--max_grad_norm", type=float, default=None)
@@ -167,7 +180,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="分布式集合通信超时；某个 rank 崩了时，这是唯一能把「卡住」变成「报错」的机制",
     )
-    return p.parse_args()
+    return p
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """`argv=None` 时读 `sys.argv`，测试可以显式传一串参数。"""
+    return build_parser().parse_args(argv)
 
 
 # ============================================================

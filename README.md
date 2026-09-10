@@ -167,7 +167,7 @@ python tools/ddp_launch.py --nproc_per_node 2 -- src/main.py --dataset synthetic
 
 | 文件 | 覆盖 |
 |------|------|
-| `tests/test_config.py` | 三级配置优先级、参数校验、YAML 往返 |
+| `tests/test_config.py` | 三级配置优先级、参数校验、YAML 往返、**配置字段 ↔ 命令行开关双向完整性**（"配置里有、命令行够不着"的坑已经攒了两个，现在由测试守） |
 | `tests/test_data.py` | 验证集切分无重叠、meta 与模型匹配、合成数据真的可分 |
 | `tests/test_model.py` | 输入尺寸推算、参数量、**检查点不改变梯度**、BN 双倍更新（canary） |
 | `tests/test_train.py` | LR 调度取值、**更新次数 = ⌈批次数 / 累积步数⌉**、`no_grad` 生效、loss 真的会降 |
@@ -316,6 +316,42 @@ assert with_rng != without_rng
 > 这个仓库里每条关键状态都配了这样一次反证 —— 断点续训这边一共做了三次：
 > 摘掉 optimizer 状态恢复 → 2 条红；摘掉 RNG 恢复 → 2 条红；
 > 存 checkpoint 时不传 loader → 端到端等价性测试红。
+
+### 第三种漂法：「配置里有、命令行够不着」
+
+做完断点续训顺手把 `TrainConfig` 的字段和 argparse 的开关对了一遍账，
+发现同一类问题已经攒了**两个**：
+
+| 字段 | 配置里 | 命令行 | 后果 |
+|------|:---:|:---:|------|
+| `save_every_epoch` | ✅ | ❌ | 想要"每轮存一份"的现场，只能去改 YAML |
+| `momentum` | ✅ | ❌ | **能选 `--optimizer sgd`，却调不了它的动量** —— 默认硬编码 0.9 |
+
+两个都不是崩溃，是**能力缺口**：功能在，够不着。这类缺口特别容易长期潜伏，
+因为它不报错、不影响已有用法，只是"你做不到某件事"。
+
+修法也照旧 —— 不补一行就完事，而是把"必须有"变成不变式：
+
+```python
+def test_every_config_field_is_reachable_from_the_cli():
+    options = {o for a in build_parser()._actions for o in a.option_strings}
+    missing = [f.name for f in dataclasses.fields(TrainConfig)
+               if f.name not in AUTO_DERIVED and f"--{f.name}" not in options]
+    assert not missing, f"这些配置项没有命令行开关：{missing}"
+```
+
+反向也补了一条：命令行上的每个开关都必须是合法配置项，否则
+`cfg.merge(**overrides)` 会抛 `ValueError: 未知配置项` —— 用户看到的是配置系统报错，
+真正的原因却是他敲的那个开关根本没人管。
+
+为此把 parser 拆成了 `build_parser()`（返回 parser）+ `parse_args(argv)`（读参数）：
+**测试拿不到 parser，就测不了"开关齐不齐"**，只能靠人眼对账，而人眼一定会漂。
+反证照做：摘掉 `--momentum` 那一块，测试精确报出 `['momentum']`。
+
+> 顺带记一个"看起来像 bug、其实不是"的：`configs/mnist.yaml` 里的
+> `num_classes` / `in_channels` 是**不会生效**的 —— 它们被 `--dataset` 的元信息覆盖。
+> 留着是为了说明，但容易让人以为改这里就能改通道数，所以在 YAML 里加了显式警告。
+> 这两个字段也因此进了 `AUTO_DERIVED` 免检名单 —— **免检要有理由，所以理由写在代码里**。
 
 ## 实测基准
 
