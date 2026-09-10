@@ -25,7 +25,7 @@
 | **断点续训** | `--resume last` 接着训；恢复权重 / Adam 矩 / `global_step` / 早停基准 / 两股随机流 → 与连续训练**逐位一致** |
 | **分布式训练 (DDP)** | 同一份 `main.py` 单卡/多卡通用（`torchrun` 自动识别）；数据分片、梯度平均、指标归约、rank0 独占落盘；含不依赖 TCPStore 的启动器 |
 | **学习率 finder** | LR range test：训练前扫一遍 lr 报告该用多少；等比取点 + 偏差修正 EMA + 权重零污染还原，输出 ASCII 曲线 |
-| **测试 + CI** | 224 个 pytest 用例（CPU 可跑，多平台 CI）；离线合成数据集，秒级验证整条流水线 |
+| **测试 + CI** | 225 个 pytest 用例（CPU 可跑，多平台 CI）；离线合成数据集，秒级验证整条流水线 |
 
 ## 目录结构
 
@@ -150,7 +150,7 @@ python experiments/exp_ddp_equivalence.py
 
 ```bash
 pip install -r requirements-dev.txt
-pytest                                    # 224 个用例，CPU 上约 3 分钟
+pytest                                    # 225 个用例，CPU 上约 3 分半
 ruff check src experiments tests tools    # lint
 
 # 不想等下载？用内置的合成数据集跑通整条流水线
@@ -175,7 +175,7 @@ python tools/ddp_launch.py --nproc_per_node 2 -- src/main.py --dataset synthetic
 | `tests/test_compile.py` | 平台探测（用 `platform_name` 让 Windows 分支在 Linux CI 上也能测）、冒烟不污染 BN、`unwrap_model` 剥嵌套包装、平台限制（canary） |
 | `tests/test_lr_finder.py` | 等比取点、**EMA 的偏差修正**、最陡下降选点、**扫描后权重逐位还原**、该关的开关都关了、结果可复现 |
 | `tests/test_checkpoint.py` | 六类状态逐项往返、**两股随机流各自可还原**、老格式能读且 `missing` 报得准、剥包装前缀、`--resume` 取值解析 → 三条**反证**（摘掉某一项，结果真的会变） |
-| `tests/test_smoke.py` | 真实 CLI 端到端跑通（`src/main.py` 与 `tools/lr_finder.py`）+ 产物落盘 + 命令行覆盖生效 + **1 轮 + 断点 + 2 轮 ≡ 连续 3 轮（逐位）** + **续训路径写错必须当场失败** + **非 UTF-8 输出编码下中文日志不崩** + 入口清单完整性 |
+| `tests/test_smoke.py` | 真实 CLI 端到端跑通（`src/main.py` 与 `tools/lr_finder.py`）+ 产物落盘 + 命令行覆盖生效 + **1 轮 + 断点 + 2 轮 ≡ 连续 3 轮（逐位；单进程与 DDP 各一条）** + **续训路径写错必须当场失败** + **非 UTF-8 输出编码下中文日志不崩** + 入口清单完整性 |
 | `tests/test_ci_annotations.py` | 诊断通道本身：`_emit` 编码无关性、hook 触发与转义、端到端断言退出码是 1 而不是 3 |
 
 两条值得单独说的测试思路：
@@ -719,6 +719,29 @@ seed 的 generator**。不传的话，`DataLoader(shuffle=True)` 每轮会从全
 "已经迭代到第几轮"这个信息只存在于 generator 的当前状态里，所以存的是
 `generator.get_state()`。
 
+### DDP 下这条路径不一样：数据顺序来自 sampler，不是 generator
+
+上面那套"两股流"的结论**在多进程下不成立** —— 但结论反而更干净。
+
+`src/data.py` 里那份显式 generator 只在 `train_sampler is None`（单进程）时才建；
+多进程下训练集用 `DistributedSampler`，它每一轮的排列由 `seed + epoch` 唯一决定。
+也就是说 DDP 下 `loader.generator` 是 `None`，`capture_rng()` 里那一项存了也没人用。
+
+于是数据顺序**完全**押在一件事上：每个 epoch 有没有把真实 epoch 传给 `set_epoch()`。
+
+```python
+for epoch in range(state.next_epoch, cfg.epochs + 1):
+    set_epoch(train_sampler, epoch)      # ← 传错了就整轮数据错位
+```
+
+漏掉它的症状极其阴险：续训后把 epoch 从 1 重新数 → 数据顺序整体错位，但 loss 曲线
+依然"很正常"、进程内的单测全绿，只有把两段 loss 序列摆在一起才看得出来。
+
+所以 `tests/test_smoke.py` 里专门有一条 **DDP 版**的等价性测试（真起 2 个进程）：同样
+拿到 **0 / 18 个张量不同**。反证也做过了 —— 把调用改成
+`set_epoch(train_sampler, epoch - (resumed_from_epoch or 0))`（即"续训后从 1 重数"）
+→ 16 / 18 个张量不同，测试精确变红。
+
 ### 实测：续训与连续训练逐位一致
 
 `--epochs 3 --batch_size 128 --save_every_epoch` 跑一次拿到 `epoch1.pt`，
@@ -730,6 +753,7 @@ seed 的 generator**。不传的话，`DataLoader(shuffle=True)` 每轮会从全
 | `history` 长度 | 3 | 3（第 1 轮是恢复来的） |
 | 逐位不同的参数张量 | — | **0 / 18** |
 | 各轮 `train_loss` | 0.6148 / 0.0015 / 0.0008 | 完全相同 |
+| 同上但跑 DDP（2 进程） | — | **0 / 18**（多一组 `set_epoch()` 的约束） |
 
 为什么敢断言"逐位"：这个模板把随机性的来源都关在明处（固定 seed、显式 shuffle
 generator、`num_workers=0`、CPU 上不开 AMP / compile），所以只要**存全了**，
@@ -743,6 +767,7 @@ generator、`num_workers=0`、CPU 上不开 AMP / compile），所以只要**存
 | `optimizer.load_state_dict(...)` | 2 条（下一步的参数就不一样了） |
 | `restore_rng(...)` | 2 条（两股随机流各自对不上） |
 | 存 checkpoint 时不传 `loader=` | 1 条（端到端等价性：loss 序列对不上） |
+| DDP 下把重编号的 epoch 交给 `set_epoch()` | 1 条（16 / 18 个张量不同） |
 
 **"必要"这件事得能证明，不能靠讲。** 而且这三条一开始只有 1 条真的有效 ——
 最早那版 RNG 测试是**恒真**的，把被测代码摘掉它照样绿（见下文
@@ -972,6 +997,19 @@ Decoupled weight decay——权重衰减不参与 Adam 的动量/二阶矩计算
 `ValueError`，用户看到的是配置系统报错，真因却是他敲的开关没人管）。
 顺带一个推论：**做这种不变式的前提是把结构暴露给测试** —— 所以 parser 被拆成了
 `build_parser()`（返回 parser）+ `parse_args(argv)`。**测试摸不到的东西，就守不住。**
+
+**Q27: DDP 下做断点续训，要恢复的随机状态和单进程有什么不同？**
+单进程要恢复**两股流**（全局 torch RNG 管 Dropout、`train_loader.generator` 管 shuffle）；
+DDP 下只剩**一股** —— 训练集用的是 `DistributedSampler`，它每一轮的排列由
+`seed + epoch` 唯一决定，`loader.generator` 是 `None`（`capture_rng()` 里那一项存了也没人用）。
+
+所以 DDP 下 shuffle 的正确性**全部**押在「每个 epoch 有没有把真实 epoch 交给
+`set_epoch()`」这一件事上。这也是个很容易写错的点：续训时顺手把 epoch 从 1 重新数，
+数据顺序就整体错位 —— 而 loss 曲线依然"很正常"、进程内单测全绿，只有把两段 loss
+摆在一起才看得出来（实测：16 / 18 个张量不同）。
+
+反过来说，DDP 下"可复现"的门槛其实**更低**：只要 `set_epoch(真实 epoch)` 守住了，
+再加上权重 / 优化器矩 / `global_step` 恢复对，就能逐位一致（实测 0 / 18）。
 
 ## 后续可扩展
 

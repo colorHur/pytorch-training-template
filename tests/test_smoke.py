@@ -307,7 +307,7 @@ def test_chinese_log_survives_non_utf8_stdout(tmp_path):
 # ============================================================
 # 分布式：真的起 2 个进程跑一遍
 # ============================================================
-def run_ddp(tmp_path: Path, exp_name: str):
+def run_ddp(tmp_path: Path, exp_name: str, *extra: str):
     """用 `tools/ddp_launch.py` 起 2 个 CPU 进程跑完整的 DDP 训练。
 
     这是唯一能覆盖「进程组初始化 + 梯度 all-reduce + 指标归约 + rank0 独占落盘」
@@ -317,6 +317,8 @@ def run_ddp(tmp_path: Path, exp_name: str):
     （比如本机的 Windows 版）根本没编进 libuv，TCPStore 直接不可用，
     且 `USE_LIBUV=0` 也救不回来。本项目的启动器改用 `FileStore` 做 rendezvous，
     绕开 TCP，所以 ubuntu / windows 的 CI 都能跑。
+
+    `*extra` 追加到 `src/main.py` 的参数后面（用于 `--epochs` / `--resume` 等）。
     """
     launcher = ROOT / "tools" / "ddp_launch.py"
     out_dir = tmp_path / "outputs"
@@ -332,6 +334,7 @@ def run_ddp(tmp_path: Path, exp_name: str):
             "--device", "cpu",
             "--epochs", "1",
             "--batch_size", "32",
+            *extra,
         ],
         capture_output=True, text=True, encoding="utf-8", errors="replace",
         cwd=str(ROOT),
@@ -388,6 +391,69 @@ def test_ddp_checkpoint_has_no_module_prefix(tmp_path):
 
     model = build_model("small_cnn", in_channels=1, num_classes=10, image_size=28)
     model.load_state_dict(ckpt["model"])
+
+
+def test_ddp_resume_reproduces_uninterrupted_training(tmp_path):
+    """DDP 下「1 轮 + 断点 + 2 轮」必须和「连续 3 轮」逐位一致。
+
+    单进程的等价性测试（`tests/test_checkpoint.py`）**覆盖不到这里**，因为多进程下
+    训练集用的是 `DistributedSampler`：它的 shuffle 顺序由 `seed + epoch` 决定，
+    `loader.generator` 是 `None` —— 也就是说续训要恢复的那六类状态里，
+    "两股随机流"这条路在 DDP 下根本不经过，数据顺序的正确性**完全**落在
+    "每个 epoch 有没有 `set_epoch(真实 epoch)`"这一件事上。
+
+    漏掉它的症状很阴险：把续训后的 epoch 从 1 重新数，数据顺序整体错位，
+    但 loss 曲线依然"很正常"，且当前进程内的单测全绿 —— 只有把两段
+    loss 序列摆在一起才看得出来。
+
+    两次都传 `--epochs 3` 是**必须的**（理由同 `test_resume_reproduces_uninterrupted_training`）：
+    `total_steps = steps_per_epoch × epochs`，把 epochs 调大，cosine 会按新的总步数
+    重新规划整条曲线，连已经训过的那轮都对不上。那本身是**正确语义**
+    （"崩了重来"要求严格等价，"接着训更多轮"重新规划才是期望行为），
+    但会让这个测试退化成"两条不同的 lr 曲线对拍" —— 实测过一次：
+    那样 16/18 个张量不同，看着像 bug，其实不是。
+    """
+    # 参照组：一次训到 3 轮，并留下第 1 轮的存档（模拟"跑到第 1 轮就崩了"）
+    proc_full, run_full = run_ddp(
+        tmp_path, "ddp_full", "--epochs", "3", "--save_every_epoch"
+    )
+    assert proc_full.returncode == 0, proc_full.stdout[-3000:]
+    epoch1 = run_full / "epoch1.pt"
+    assert epoch1.exists(), "没有 --save_every_epoch 就没有可续训的现场"
+    full = torch.load(run_full / "last.pt", map_location="cpu", weights_only=False)
+
+    # 对照组：从这个存档续训到 3 轮（epochs 不变 → lr 曲线不变）
+    proc_rest, run_resume = run_ddp(
+        tmp_path, "ddp_resume", "--epochs", "3", "--resume", str(epoch1)
+    )
+    assert proc_rest.returncode == 0, proc_rest.stdout[-3000:]
+    assert "从第 2 个 epoch 继续" in proc_rest.stdout, (
+        "续训没被真正触发（打印里没有'从第 2 个 epoch 继续'）—— "
+        "那样这个测试就变成'连续 3 轮 vs 连续 3 轮'，恒真了"
+    )
+    resumed = torch.load(run_resume / "last.pt", map_location="cpu", weights_only=False)
+
+    # 1) 进度一致
+    assert resumed["epoch"] == 3
+    assert resumed["global_step"] == full["global_step"], (
+        f"global_step 对不上：{resumed['global_step']} vs {full['global_step']}"
+    )
+    assert [h["epoch"] for h in resumed["history"]] == [1, 2, 3]
+
+    # 2) 权重逐位一致 —— 这才是"续训真的接上了"的证据
+    differing = [
+        k for k in full["model"] if not torch.equal(full["model"][k], resumed["model"][k])
+    ]
+    assert not differing, (
+        f"{len(differing)}/{len(full['model'])} 个张量不一致：{differing[:5]}\n"
+        "DDP 下最可能的原因是续训时 set_epoch() 收到的不是真实 epoch"
+    )
+
+    # 3) loss 序列逐轮一致
+    full_losses = [round(h["train_loss"], 8) for h in full["history"]]
+    resumed_losses = [round(h["train_loss"], 8) for h in resumed["history"]]
+    assert full_losses == resumed_losses, f"{full_losses} != {resumed_losses}"
+    assert [h["val_acc"] for h in full["history"]] == [h["val_acc"] for h in resumed["history"]]
 
 
 # ============================================================
