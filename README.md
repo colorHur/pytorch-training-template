@@ -525,6 +525,23 @@ Decoupled weight decay——权重衰减不参与 Adam 的动量/二阶矩计算
 必须 `unwrap_model(model).state_dict()`。直接 `model.state_dict()` 的 key 会带 `module.` 前缀
 （`module.blocks.0.0.weight`），单进程加载时全部对不上 —— 而且**保存时不会有任何提示**，属于埋雷型 bug。
 
+**Q19: 本地测试全绿、CI 的 windows job 却红了，你怎么排查？**
+先怀疑**环境差异**，不是逻辑：locale / 编码 / 路径分隔符 / 文件系统大小写敏感 / 行尾 CRLF。
+本仓库踩过两次同一个：Python 在 Windows **输出到管道**时用系统 locale 编码（英文系统 = cp1252），
+`print("中文")` 直接抛 `UnicodeEncodeError`，exit code 1。**终端场景不发作，中文 locale（cp936）
+也不发作**，所以只有 CI 见得到。
+手法是**在本地重建 CI 的环境条件**：`PYTHONIOENCODING=cp1252 pytest tests/ -q` —— 一次复现，
+真因一行定位，比盯着代码猜快一个量级。
+
+**Q20: 同一个 bug 修完之后又犯了，你会做什么？**
+先问"**为什么第一次修完没防住第二次**"。答案通常是：修的是那个点，不是那类事。
+本仓库的做法是把不变式写成测试：`test_entrypoint_pins_utf8_stdout` 扫描**全部可执行入口**，
+漏一个就红 —— 注意断言的是带括号的**调用**而不是函数名，否则
+`from console import force_utf8_stdout`（导入但没调用）就能骗过它。
+另一半教训是：**诊断工具自己也要有测试**。给 CI 加的失败注解 hook 自己也会在 cp1252 下崩，
+把 pytest 退出码从 1 变成 3，于是"CI 红了却什么都读不到"。
+分辨方法是看退出码 —— **3 是 hook 崩了，1 是注解被 GitHub 丢弃**（格式问题）。
+
 ## 后续可扩展
 
 - [x] `gradient checkpointing` 演示（用计算换显存的量化对比）
