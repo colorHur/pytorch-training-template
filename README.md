@@ -25,7 +25,7 @@
 | **断点续训** | `--resume last` 接着训；恢复权重 / Adam 矩 / `global_step` / 早停基准 / 两股随机流 → 与连续训练**逐位一致** |
 | **分布式训练 (DDP)** | 同一份 `main.py` 单卡/多卡通用（`torchrun` 自动识别）；数据分片、梯度平均、指标归约、rank0 独占落盘；含不依赖 TCPStore 的启动器 |
 | **学习率 finder** | LR range test：训练前扫一遍 lr 报告该用多少；等比取点 + 偏差修正 EMA + 权重零污染还原，输出 ASCII 曲线 |
-| **测试 + CI** | 225 个 pytest 用例（CPU 可跑，多平台 CI）；离线合成数据集，秒级验证整条流水线 |
+| **测试 + CI** | 227 个 pytest 用例（CPU 可跑，多平台 CI）；离线合成数据集，秒级验证整条流水线 |
 
 ## 目录结构
 
@@ -150,7 +150,7 @@ python experiments/exp_ddp_equivalence.py
 
 ```bash
 pip install -r requirements-dev.txt
-pytest                                    # 225 个用例，CPU 上约 3 分半
+pytest                                    # 227 个用例，CPU 上约 4 分钟
 ruff check src experiments tests tools    # lint
 
 # 不想等下载？用内置的合成数据集跑通整条流水线
@@ -175,7 +175,7 @@ python tools/ddp_launch.py --nproc_per_node 2 -- src/main.py --dataset synthetic
 | `tests/test_compile.py` | 平台探测（用 `platform_name` 让 Windows 分支在 Linux CI 上也能测）、冒烟不污染 BN、`unwrap_model` 剥嵌套包装、平台限制（canary） |
 | `tests/test_lr_finder.py` | 等比取点、**EMA 的偏差修正**、最陡下降选点、**扫描后权重逐位还原**、该关的开关都关了、结果可复现 |
 | `tests/test_checkpoint.py` | 六类状态逐项往返、**两股随机流各自可还原**、老格式能读且 `missing` 报得准、剥包装前缀、`--resume` 取值解析 → 三条**反证**（摘掉某一项，结果真的会变） |
-| `tests/test_smoke.py` | 真实 CLI 端到端跑通（`src/main.py` 与 `tools/lr_finder.py`）+ 产物落盘 + 命令行覆盖生效 + **1 轮 + 断点 + 2 轮 ≡ 连续 3 轮（逐位；单进程与 DDP 各一条）** + **续训路径写错必须当场失败** + **非 UTF-8 输出编码下中文日志不崩** + 入口清单完整性 |
+| `tests/test_smoke.py` | 真实 CLI 端到端跑通（`src/main.py` 与 `tools/lr_finder.py`）+ 产物落盘 + 命令行覆盖生效 + **1 轮 + 断点 + 2 轮 ≡ 连续 3 轮（逐位；单进程与 DDP 各一条）** + **续训路径写错必须当场失败** + **可复现性（同命令两遍摘要一致，换 seed 摘要必须变）** + **非 UTF-8 输出编码下中文日志不崩** + 入口清单完整性 |
 | `tests/test_ci_annotations.py` | 诊断通道本身：`_emit` 编码无关性、hook 触发与转义、端到端断言退出码是 1 而不是 3 |
 
 两条值得单独说的测试思路：
@@ -1011,6 +1011,21 @@ DDP 下只剩**一股** —— 训练集用的是 `DistributedSampler`，它每�
 反过来说，DDP 下"可复现"的门槛其实**更低**：只要 `set_epoch(真实 epoch)` 守住了，
 再加上权重 / 优化器矩 / `global_step` 恢复对，就能逐位一致（实测 0 / 18）。
 
+**Q28: 怎么把"可复现"从一句口号变成一条被验证的性质？**
+一条正向断言 + 一条反向断言，缺一不可：
+
+- **正向**：同一条命令跑两遍，`state_dict` 的 sha256 摘要逐位相同。
+  摘要要**只覆盖参数**（key 排序 + 形状 + 原始字节），别用文件哈希 —— 文件里还有
+  optimizer / RNG 状态，那样测的会变成"文件是否逐字节相同"，指向就不清楚了。
+- **反向**：换个 seed，摘要**必须变**。没有这一条，正向那条有可能是恒真的
+  （摘要函数写错、两次实际跑的是同一个目录、参数压根没被训练改动过都符合）。
+  **先证明判据有分辨力，再用它下结论。**
+- 顺手一条"脚手架自证"：断言两次真的写进了**不同目录** —— 拿同一个文件和自己比永远是绿的。
+
+为什么值得单独测：训练跑不出相同结果，原因通常不是"忘了 `set_seed`"，而是某条支路
+**偷偷用了另一股随机源**（DataLoader 每轮从全局 RNG 现取 shuffle 种子、数据增强用了
+`random` 而只 seed 了 torch、多进程 worker 各自播种……）。这类错误跑得通、loss 也正常。
+
 ## 后续可扩展
 
 - [x] `gradient checkpointing` 演示（用计算换显存的量化对比）
@@ -1021,11 +1036,21 @@ DDP 下只剩**一股** —— 训练集用的是 `DistributedSampler`，它每�
       实测 MNIST 上 100 步 16 秒、建议值 1.262e-3（与默认 lr 差 0.79×）
 - [x] 断点续训（`--resume last|best|<path>`）：六类状态 + 两股随机流全恢复，
       实测「1 轮 + 续训 2 轮」与「连续 3 轮」权重**逐位一致**（0/18 个张量不同）
-- [ ] 分布式 checkpoint：只让 rank0 落盘、恢复时先 barrier；顺带把
-      `DistributedSampler` 的 `set_epoch` 与续训的交互补上（本仓库已是
-      `set_epoch(真实 epoch)`，天然正确，但缺一条测试）
-- [ ] 端到端的梯度/参数一致性测试：在 CI 上跑两遍小训练，比对 hash
-      （把"可复现"从"靠 seed"升级成"被验证"）
+- [x] 分布式 checkpoint：rank0 独占落盘（`if ctx.is_main`），各 rank 读同一份存档。
+      恢复阶段**不需要 barrier** —— 全部 rank 都是只读，没有人会在别人读到一半时写；
+      真正需要 barrier 的是**训练结束后**读 `best.pt` 那一步（等 rank0 写完，
+      见 `src/main.py` 里的 `barrier(ctx)`）。
+      `DistributedSampler` 的 `set_epoch` 与续训的交互已由 DDP 版等价性测试守住（0/18）
+- [x] 端到端可复现性测试：同一条命令跑两遍，比对 `state_dict` 的 sha256 摘要
+      （`test_same_command_produces_bit_identical_parameters`）；外加一条**反向断言**
+      "换 seed 摘要必须变" —— **先证明判据有分辨力，再用它下结论**。
+      反证：摘掉 `torch.manual_seed` → 两次摘要立刻不同（测试红）。
+
+还有意留着没做的：
+
+- Linux 上的 `torch.compile` **真实加速**对比（本机 Windows 两条路都断，所以没编数据）
+- 混合精度在 GPU 上的完整基准（本仓库只在 CPU 上验证了它「被正确关闭并告警」）
+- `torch.profiler` 一节：把"显存账"升级成"时间账"
 
 ## License
 

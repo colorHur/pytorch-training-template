@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -235,6 +236,81 @@ def test_resume_with_a_missing_checkpoint_fails_loudly(tmp_path):
     assert proc.returncode != 0, "续训路径不存在，进程却正常退出了"
     assert "no_such_ckpt.pt" in proc.stdout + proc.stderr
     assert not (run_dir / "summary.json").exists(), "没恢复成功却写了 summary —— 等于假装训练完成"
+
+
+# ============================================================
+# 可复现性：同一条命令跑两遍，参数逐位相同
+# ============================================================
+def parameter_digest(ckpt_path: Path) -> str:
+    """把 `state_dict` 压成一个稳定摘要：key 排序 + 形状 + 原始字节。
+
+    为什么不用 `pickle` 的哈希 / 文件哈希：**文件里还有别的字段**（时间戳之类没有，
+    但 optimizer 状态、RNG 状态都在），任何一处无关变化都会让"两次不同"，
+    于是这条测试就变成在测"文件是否逐字节相同"，而不是"参数是否相同"。
+    只摘要参数，指向才清楚。
+    """
+    state = torch.load(ckpt_path, map_location="cpu", weights_only=False)["model"]
+    digest = hashlib.sha256()
+    for key in sorted(state):
+        tensor = state[key].detach().cpu().contiguous()
+        digest.update(key.encode("utf-8"))
+        digest.update(str(tuple(tensor.shape)).encode("utf-8"))
+        try:
+            payload = tensor.numpy().tobytes()
+        except TypeError:              # bfloat16 之类没有 numpy dtype
+            payload = tensor.to(torch.float32).numpy().tobytes()
+        digest.update(payload)
+    return digest.hexdigest()
+
+
+REPRO_ARGS = ("--epochs", "1", "--batch_size", "128", "--device", "cpu")
+
+
+def test_same_command_produces_bit_identical_parameters(tmp_path):
+    """把"靠 seed 应该能复现"升级成"被验证过能复现"。
+
+    训练跑不出相同结果，原因通常不是"忘了 set_seed"，而是某条支路**偷偷用了另一股
+    随机源**：DataLoader 每轮从全局 RNG 现取 shuffle 种子、数据增强用了 `random`
+    而只 seed 了 torch、多进程 worker 各自播种……这类错误**跑得通、loss 也正常**，
+    只有"同一命令跑两遍"才会暴露。
+
+    所以判据不该是"我看代码里设了 seed"，而是一条断言。
+    """
+    first, dir_a = run_main(tmp_path, *REPRO_ARGS, exp_name="repro_a")
+    second, dir_b = run_main(tmp_path, *REPRO_ARGS, exp_name="repro_b")
+    assert first.returncode == 0, first.stdout[-2500:]
+    assert second.returncode == 0, second.stdout[-2500:]
+
+    # 先证明"确实是两次独立的运行" —— 拿同一个文件和自己比是恒真的
+    assert dir_a != dir_b
+    assert (dir_a / "last.pt").resolve() != (dir_b / "last.pt").resolve()
+
+    assert parameter_digest(dir_a / "last.pt") == parameter_digest(dir_b / "last.pt"), (
+        "同一条命令跑两遍，参数居然不同 —— 有一条随机支路没被 seed 管住"
+    )
+
+    # 指标层面也要一致：同一串浮点运算，应该逐位相同
+    summary_a = json.loads((dir_a / "summary.json").read_text(encoding="utf-8"))
+    summary_b = json.loads((dir_b / "summary.json").read_text(encoding="utf-8"))
+    assert [row["train_loss"] for row in summary_a["history"]] == [
+        row["train_loss"] for row in summary_b["history"]
+    ]
+    assert summary_a["test_acc"] == summary_b["test_acc"]
+
+
+def test_changing_the_seed_changes_the_parameters(tmp_path):
+    """反向断言：换个 seed，参数必须变。
+
+    没有这一条，上面那条测试有可能是**恒真**的 —— 比如摘要函数把空字典算了进去、
+    两次实际跑的是同一个目录、或者参数根本没被训练改动过。
+    **先证明这个判据有分辨力，再用它下结论。**
+    """
+    _, base = run_main(tmp_path, *REPRO_ARGS, exp_name="seed_base")
+    _, other = run_main(tmp_path, *REPRO_ARGS, "--seed", "1", exp_name="seed_other")
+
+    assert parameter_digest(base / "last.pt") != parameter_digest(other / "last.pt"), (
+        "换了 seed 参数却完全一样 —— 要么 seed 没被用上，要么这个摘要没有分辨力"
+    )
 
 
 # ============================================================
