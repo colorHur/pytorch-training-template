@@ -191,3 +191,89 @@ def test_chinese_log_survives_non_utf8_stdout(tmp_path):
     )
     assert "UnicodeEncodeError" not in proc.stderr
     assert "训练完成" in proc.stdout          # 中文确实完整写出来了
+
+
+# ============================================================
+# 分布式：真的起 2 个进程跑一遍
+# ============================================================
+def run_ddp(tmp_path: Path, exp_name: str):
+    """用 `tools/ddp_launch.py` 起 2 个 CPU 进程跑完整的 DDP 训练。
+
+    这是唯一能覆盖「进程组初始化 + 梯度 all-reduce + 指标归约 + rank0 独占落盘」
+    整条链路的测试 —— 进程内的单元测试测不到真正的集合通信。
+
+    为什么不用 `torchrun`：它需要一个 TCPStore，而某些 torch 构建
+    （比如本机的 Windows 版）根本没编进 libuv，TCPStore 直接不可用，
+    且 `USE_LIBUV=0` 也救不回来。本项目的启动器改用 `FileStore` 做 rendezvous，
+    绕开 TCP，所以 ubuntu / windows 的 CI 都能跑。
+    """
+    launcher = ROOT / "tools" / "ddp_launch.py"
+    out_dir = tmp_path / "outputs"
+    proc = subprocess.run(
+        [
+            sys.executable, str(launcher), "--nproc_per_node", "2", "--",
+            str(MAIN),
+            "--config", str(CONFIG),
+            "--output_dir", str(out_dir),
+            "--exp_name", exp_name,
+            "--dataset", "synthetic",
+            "--num_workers", "0",
+            "--device", "cpu",
+            "--epochs", "1",
+            "--batch_size", "32",
+        ],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        cwd=str(ROOT),
+        env={**os.environ, "CUDA_VISIBLE_DEVICES": ""},
+        timeout=600,
+    )
+    return proc, out_dir / exp_name
+
+
+def test_ddp_two_processes_end_to_end(tmp_path):
+    proc, run_dir = run_ddp(tmp_path, "e2e_ddp")
+    assert proc.returncode == 0, (
+        f"DDP 多进程训练失败\n{proc.stdout[-4000:]}\n{proc.stderr[-2000:]}"
+    )
+
+    summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+
+    # 1) 确实走了分布式路径
+    assert summary["distributed"]["enabled"] is True
+    assert summary["distributed"]["world_size"] == 2
+    assert summary["distributed"]["backend"] == "gloo"
+    # 2) 全局等效 batch 必须把进程数算进去（32 × 累积1 × 2进程 = 64）
+    assert summary["distributed"]["global_effective_batch_size"] == 64
+    # 3) 指标是 all-reduce 后的全局值，必须是合法概率
+    assert 0.0 <= summary["test_acc"] <= 1.0
+    # 4) 产物齐全（只有 rank 0 写，所以日志没被两个进程写坏）
+    for name in ["best.pt", "summary.json", "config_resolved.yaml", "train.log"]:
+        assert (run_dir / name).exists(), f"缺少产物 {name}"
+    # 5) 两个 rank 都正常退出
+    assert "DDP 已启用" in proc.stdout
+    assert "rank 0/2" in proc.stdout
+    assert "[rank 0] 退出码 0" in proc.stdout
+    assert "[rank 1] 退出码 0" in proc.stdout
+
+
+def test_ddp_checkpoint_has_no_module_prefix(tmp_path):
+    """DDP 存出来的 checkpoint 必须能被**单进程**代码加载（key 不能带 `module.`）。
+
+    不 unwrap 就 `state_dict()`，key 会变成 `module.blocks.0.0.weight`，
+    单进程加载时全部对不上 —— 而且保存当时毫无提示，属于"埋雷"型 bug。
+    """
+    proc, run_dir = run_ddp(tmp_path, "e2e_ddp_ckpt")
+    assert proc.returncode == 0, proc.stdout[-3000:]
+
+    ckpt = torch.load(run_dir / "best.pt", map_location="cpu", weights_only=False)
+    keys = list(ckpt["model"])
+    assert keys, "checkpoint 里没有参数"
+    assert not any(k.startswith("module.") for k in keys), (
+        f"checkpoint 的 key 带了 DDP 前缀，单进程加载不了：{keys[:3]}"
+    )
+
+    # 真加载进一个单进程模型，确认 key 完全对得上（strict=True 由 load_state_dict 默认保证）
+    from src.model import build_model
+
+    model = build_model("small_cnn", in_channels=1, num_classes=10, image_size=28)
+    model.load_state_dict(ckpt["model"])

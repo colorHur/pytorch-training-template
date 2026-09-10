@@ -31,10 +31,12 @@ jobs:
           pip install -r requirements-dev.txt
 
       - name: lint
-        run: ruff check src experiments tests
+        run: ruff check src experiments tests tools
 
       - name: 跑测试
         # 强制走 CPU 路径：CI 机器没有 GPU，同时也顺带验证「无 CUDA 也能跑」
+        # 也顺带验证 gloo 后端下的 DDP（多进程测试用 FileStore 做 rendezvous，
+        # 不依赖 TCPStore）
         env:
           CUDA_VISIBLE_DEVICES: ""
         run: pytest tests/ -v --durations=10

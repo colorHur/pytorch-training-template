@@ -93,16 +93,24 @@ def test_build_dataloaders_offline():
     loaders = build_dataloaders(
         "synthetic", batch_size=32, val_ratio=0.2, num_workers=0, pin_memory=False
     )
-    assert set(loaders) == {"train", "val", "test", "meta"}
+    assert set(loaders) == {"train", "val", "test", "meta", "samplers"}
     assert loaders["meta"]["num_classes"] == 10
     assert loaders["meta"]["in_channels"] == 1
     assert len(loaders["train"].dataset) == 800
     assert len(loaders["val"].dataset) == 200
 
+    # 单进程时三个 sampler 都必须是 None（由 ctx=None 触发），训练循环据此短路
+    assert loaders["samplers"] == {"train": None, "val": None, "test": None}
+
     x, y = next(iter(loaders["train"]))
     assert x.shape[1:] == (1, 28, 28)
     assert x.dtype == torch.float32
     assert y.dtype == torch.int64
+
+    # drop_last 必须交给 sampler 控制，DataLoader 自己不能丢尾巴
+    # （否则最后一个不满的 batch 会被吞掉，验证集/测试集样本数会莫名变少）
+    assert loaders["train"].drop_last is False
+    assert loaders["val"].drop_last is False
 
 
 def test_build_dataloaders_unknown_dataset():

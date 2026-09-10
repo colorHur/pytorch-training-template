@@ -39,6 +39,8 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
+from src.distributed import ddp_no_sync, reduce_sums
+
 
 # ============================================================
 # 学习率调度器
@@ -87,11 +89,20 @@ def build_lr_scheduler(optimizer, name: str, total_steps: int, warmup_steps: int
 # 评测
 # ============================================================
 @torch.no_grad()
-def evaluate(model: nn.Module, loader: DataLoader, criterion, device: str) -> dict[str, float]:
+def evaluate(
+    model: nn.Module, loader: DataLoader, criterion, device: str, ctx=None
+) -> dict[str, float]:
     """在验证/测试集上跑一遍，返回 loss 和 accuracy。
 
     @torch.no_grad() 的作用：不构建计算图，省显存且更快。
     ⚠️ 忘了加会导致评估阶段显存暴涨（甚至 OOM）。
+
+    分布式下这里有个关键细节
+    ----------------------
+    **不能先各自算均值再平均**（`mean(acc_r) ≠ 全局 acc`）——
+    因为各 rank 的样本数可能差 1，而且这样算出来的指标依赖于 world_size。
+    正确做法是各 rank 上报 `(loss 总和, 正确数, 样本数)`，all-reduce 求和后**再相除**。
+    单进程时 `ctx=None`，下面的归约直接短路，零开销。
     """
     model.eval()                      # 切换 BN / Dropout 到推理模式
     total_loss, correct, total = 0.0, 0, 0
@@ -106,6 +117,12 @@ def evaluate(model: nn.Module, loader: DataLoader, criterion, device: str) -> di
         correct += (logits.argmax(dim=1) == y).sum().item()
         total += y.size(0)
 
+    if ctx is not None and ctx.enabled:
+        total_loss, correct, total = reduce_sums([total_loss, correct, total], ctx)
+
+    # 注意：这里**不**给 total 兜底。空 loader 会让 total 保持 0，
+    # 除法直接抛 ZeroDivisionError —— 这是故意的：静默返回 0 会被误读成"模型全错"，
+    # 比崩溃更难查。
     return {"loss": total_loss / total, "acc": correct / total}
 
 
@@ -125,6 +142,7 @@ def train_one_epoch(
     total_steps: int = 0,
     scaler=None,
     logger=None,
+    ctx=None,
 ) -> tuple[dict[str, float], int]:
     """跑一个 epoch，返回 (统计信息, 更新后的 global_step)。"""
     model.train()                     # ⚠️ 必须在每个 epoch 开头调用（evaluate 会切到 eval）
@@ -135,6 +153,9 @@ def train_one_epoch(
     for i, (x, y) in enumerate(loader):
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
+
+        # 本 micro-step 结束后要不要真正更新参数（攒够 accum 步，或到了最后一个 batch）
+        is_update_step = ((i + 1) % accum == 0) or ((i + 1) == len(loader))
 
         # ---- 1) 清空梯度 ----
         # set_to_none=True 比填 0 更省内存（直接把 .grad 置 None，而非分配全零张量）
@@ -149,13 +170,15 @@ def train_one_epoch(
         # ---- 3) 反向 ----
         # 梯度累积：损失要除以累积步数，否则梯度会放大 accum 倍
         loss_scaled = loss / accum
-        if scaler is not None:
-            scaler.scale(loss_scaled).backward()
-        else:
-            loss_scaled.backward()
+        # DDP + 梯度累积：中间几步用 no_sync() 跳过 all-reduce（纯通信优化，
+        # 不加结果也对，只是白通信 —— 见 distributed.ddp_no_sync 的说明）
+        with ddp_no_sync(model, ctx, skip=not is_update_step):
+            if scaler is not None:
+                scaler.scale(loss_scaled).backward()
+            else:
+                loss_scaled.backward()
 
         # ---- 4) 参数更新（攒够 accum 步才更新）----
-        is_update_step = ((i + 1) % accum == 0) or ((i + 1) == len(loader))
         if is_update_step:
             if cfg.max_grad_norm > 0:
                 if scaler is not None:
@@ -187,6 +210,10 @@ def train_one_epoch(
                 f"    epoch {epoch} | step {i + 1:>4}/{len(loader)} | "
                 f"loss {running_loss / seen:.4f} | acc {correct / seen:.4f} | lr {cur_lr:.2e}"
             )
+
+    # 分布式：把各 rank 的「和」汇总后再相除（不是把各自的均值再平均）
+    if ctx is not None and ctx.enabled:
+        running_loss, correct, seen = reduce_sums([running_loss, correct, seen], ctx)
 
     stats = {
         "loss": running_loss / max(1, seen),

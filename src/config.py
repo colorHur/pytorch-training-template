@@ -68,6 +68,10 @@ class TrainConfig:
     # ---- 运行设备 ----
     device: str = "auto"             # auto / cuda / cpu
 
+    # ---- 分布式（仅 torchrun 多进程时生效）----
+    sync_bn: bool = False            # DDP 下把 BN 换成 SyncBatchNorm（跨卡统计）
+    ddp_timeout_minutes: int = 30    # 集合通信超时；调小能让 deadlock 快速暴露
+
     def __post_init__(self) -> None:
         if self.batch_size <= 0:
             raise ValueError("batch_size 必须 > 0")

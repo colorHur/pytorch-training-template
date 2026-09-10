@@ -27,6 +27,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 
 # 让 `python src/main.py` 和 `python -m src.main` 都能跑
@@ -35,6 +36,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src import force_utf8_stdout
 from src.config import TrainConfig
 from src.data import build_dataloaders
+from src.distributed import (
+    barrier,
+    maybe_convert_sync_bn,
+    set_epoch,
+    setup_distributed,
+    unwrap_model,
+    wrap_model,
+)
 from src.model import build_model, count_parameters, enable_gradient_checkpointing
 from src.train import build_lr_scheduler, evaluate, train_one_epoch
 
@@ -82,11 +91,15 @@ def save_checkpoint(path: Path, model, optimizer, epoch, global_step, cfg, metri
 
     为什么要把 cfg 也存进去？
       半年后回看这个实验，只有权重没有超参 = 无法复现。配置跟着 checkpoint 走。
+
+    为什么必须先 unwrap？
+      DDP 包装后 `model.state_dict()` 的 key 会变成 `module.blocks.0.0.weight`。
+      存成那样，单进程代码就加载不了了 —— 而且保存时不会有任何报错。
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
-            "model": model.state_dict(),
+            "model": unwrap_model(model).state_dict(),
             "optimizer": optimizer.state_dict(),
             "epoch": epoch,
             "global_step": global_step,
@@ -157,13 +170,25 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--log_interval", type=int, default=None)
     p.add_argument("--early_stop_patience", type=int, default=None)
     p.add_argument("--device", type=str, default=None, choices=["auto", "cuda", "cpu"])
+    p.add_argument(
+        "--sync_bn",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="把 BatchNorm 换成 SyncBatchNorm（DDP 下 BN 统计量默认不跨卡同步）",
+    )
+    p.add_argument(
+        "--ddp_timeout_minutes",
+        type=int,
+        default=None,
+        help="分布式集合通信超时；某个 rank 崩了时，这是唯一能把「卡住」变成「报错」的机制",
+    )
     return p.parse_args()
 
 
 # ============================================================
 # 主流程
 # ============================================================
-def main() -> None:
+def run_training() -> None:
     # 第一件事就把输出编码钉死成 UTF-8。
     # 这条日志全是中文，而 Windows 上输出到管道时 Python 用系统 locale 编码
     # （英文系统 = cp1252），不设就会 UnicodeEncodeError 把整个训练带崩。
@@ -191,16 +216,31 @@ def main() -> None:
         cfg = cfg.merge(amp=False)
         amp_downgraded = True
 
+    # ---- 分布式：torchrun 会把 RANK/LOCAL_RANK/WORLD_SIZE 写进环境变量 ----
+    # 单进程（python src/main.py）时 world_size=1，ctx.enabled=False，下面所有
+    # 分布式分支都短路，行为与之前完全一致。
+    ctx = setup_distributed(device, timeout_minutes=cfg.ddp_timeout_minutes)
+    if ctx.enabled:
+        device = ctx.device          # nccl 下每个 rank 绑定自己的 local_rank
+
+    # ⚠️ 所有 rank 用**同一个** seed，这一点很反直觉但必须如此：
+    #    切分训练/验证集用的就是这个 seed。如果按 rank 偏移，
+    #    每个进程切出的验证集都不一样，各 rank 的指标根本对不上。
+    #    各 rank 的数据差异由 DistributedSampler 的 rank 决定，不靠 seed。
+    #    （模型初始权重也不需要对齐 —— DDP 构造时会广播 rank 0 的参数。）
     set_seed(cfg.seed)
 
     # ---- 输出目录 ----
     run_dir = HERE / cfg.output_dir / cfg.exp_name
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    # ---- 双路日志：控制台 + 文件 ----
-    log_file = (run_dir / "train.log").open("w", encoding="utf-8")
+    # ---- 双路日志：控制台 + 文件（**只有 rank 0 写**）----
+    # N 个进程同时往同一个 train.log 里写会互相覆盖，写出损坏的日志。
+    log_file = (run_dir / "train.log").open("w", encoding="utf-8") if ctx.is_main else None
 
     def log(msg: str) -> None:
+        if log_file is None:         # 非主进程：静默，但**必须继续往下跑**
+            return
         print(msg)
         log_file.write(msg + "\n")
         log_file.flush()
@@ -209,6 +249,8 @@ def main() -> None:
     log(cfg.summary())
     log(f"  设备: {device}" + (f" ({gpu_name()})" if device == "cuda" and gpu_name() else ""))
     log(f"  输出目录: {run_dir}\n")
+    if ctx.enabled:
+        log(f"  {ctx.describe()}\n")
     if amp_downgraded:
         log("⚠️  指定了 AMP 但设备是 CPU，已自动关闭混合精度\n")
 
@@ -222,16 +264,24 @@ def main() -> None:
         val_ratio=cfg.val_ratio,
         num_workers=cfg.num_workers,
         seed=cfg.seed,
+        ctx=ctx,
     )
     meta = loaders["meta"]
     cfg = cfg.merge(num_classes=meta["num_classes"], in_channels=meta["in_channels"])
     # image_size 是数据集属性而非超参，不进配置，直接从 meta 取
     image_size = meta.get("image_size", 28)
+    train_sampler = loaders["samplers"]["train"]
     log(
         f"      train {len(loaders['train'].dataset)} 张 | "
         f"val {len(loaders['val'].dataset)} 张 | test {len(loaders['test'].dataset)} 张 "
         f"({time.time() - t0:.1f}s)"
     )
+    if ctx.enabled:
+        log(
+            f"      本 rank 分到 {len(loaders['train'])} 个 batch"
+            f"（全局等效 batch = {cfg.effective_batch_size} × {ctx.world_size} = "
+            f"{cfg.effective_batch_size * ctx.world_size}）"
+        )
 
     # ---- 模型 ----
     log("[2/5] 建模型...")
@@ -257,9 +307,26 @@ def main() -> None:
     total, trainable = count_parameters(model)
     log(f"      {cfg.model}: 总参数 {total:,} / 可训练 {trainable:,}（输入 {image_size}×{image_size}）")
 
-    # ---- 优化器 / 调度器 / 损失 ----
+    # ---- SyncBatchNorm（必须在包 DDP 之前换）----
+    # 注意：SyncBatchNorm 只在 CUDA 上可用（CPU 前向直接抛 ValueError），
+    # 所以 maybe_convert_sync_bn 在 gloo 后端下会拒绝转换。
+    sync_bn_active = maybe_convert_sync_bn(model, cfg.sync_bn, ctx)
+    if cfg.sync_bn:
+        if sync_bn_active:
+            log("      SyncBatchNorm：已启用（BN 统计量跨卡同步）")
+        elif not ctx.enabled:
+            log("      SyncBatchNorm：未启用（单进程不需要）")
+        elif ctx.backend != "nccl":
+            log("      ⚠️  SyncBatchNorm：已忽略（只在 CUDA 上可用，当前 backend=gloo）")
+        else:
+            log("      SyncBatchNorm：未启用（模型里没有 BatchNorm）")
+
+    # ---- 优化器 / 调度器 / 损失（要在包 DDP 之前建好，参数引用才对得上）----
     optimizer = build_optimizer(model, cfg)
     criterion = nn.CrossEntropyLoss()
+
+    # ---- 包成 DDP（单进程时原样返回）----
+    model = wrap_model(model, ctx)
 
     steps_per_epoch = len(loaders["train"]) // cfg.grad_accum_steps
     total_steps = steps_per_epoch * cfg.epochs
@@ -288,6 +355,9 @@ def main() -> None:
     t_train = time.time()
 
     for epoch in range(1, cfg.epochs + 1):
+        # ⚠️ 每个 epoch 必须调一次，否则每轮的 shuffle 顺序完全相同（等于没打乱）
+        set_epoch(train_sampler, epoch)
+
         train_stats, global_step = train_one_epoch(
             model=model,
             loader=loaders["train"],
@@ -300,9 +370,10 @@ def main() -> None:
             lr_schedule=lr_schedule,
             total_steps=total_steps,
             scaler=scaler,
-            logger=log,
+            logger=log,          # 非主进程的 log 是空操作，不会重复刷屏
+            ctx=ctx,
         )
-        val_stats = evaluate(model, loaders["val"], criterion, device)
+        val_stats = evaluate(model, loaders["val"], criterion, device, ctx=ctx)
 
         log(
             f"  ▶ epoch {epoch}/{cfg.epochs}  "
@@ -323,10 +394,11 @@ def main() -> None:
             }
         )
 
-        # ---- 保存最优 & 早停 ----
+        # ---- 保存最优 & 早停（只有 rank 0 落盘；早停条件各 rank 一致，不会分叉）----
         if val_stats["acc"] > best_val_acc:
             best_val_acc = val_stats["acc"]
-            save_checkpoint(best_path, model, optimizer, epoch, global_step, cfg, val_stats)
+            if ctx.is_main:
+                save_checkpoint(best_path, model, optimizer, epoch, global_step, cfg, val_stats)
             patience_counter = 0
         else:
             patience_counter += 1
@@ -334,19 +406,24 @@ def main() -> None:
                 log(f"  ⏹ 早停触发（val_acc 连续 {patience_counter} 个 epoch 未提升）")
                 break
 
-        if cfg.save_every_epoch:
+        if cfg.save_every_epoch and ctx.is_main:
             save_checkpoint(run_dir / f"epoch{epoch}.pt", model, optimizer, epoch, global_step, cfg, val_stats)
 
     train_time = time.time() - t_train
 
     # ---- 测试集最终评测（只跑一次）----
+    # 非主进程也要读同一个 best.pt —— 所以必须 barrier 等 rank 0 写完再读，
+    # 否则会读到一个写了一半的文件。
+    barrier(ctx)
     log("\n[5/5] 用最优权重在测试集上评测...")
     ckpt = torch.load(best_path, map_location=device, weights_only=False)
-    model.load_state_dict(ckpt["model"])
-    test_stats = evaluate(model, loaders["test"], criterion, device)
+    unwrap_model(model).load_state_dict(ckpt["model"])
+    test_stats = evaluate(model, loaders["test"], criterion, device, ctx=ctx)
     log(f"      测试集：loss {test_stats['loss']:.4f} | acc {test_stats['acc']:.4f}")
 
-    # ---- 汇总落盘 ----
+    # ---- 汇总落盘（只有 rank 0 写）----
+    # 注意 loss/acc 这类指标是 all-reduce 后的全局值，只有 rank 0 的数是准的，
+    # 所以 summary 由主进程独占写入是顺理成章的。
     summary = {
         "exp_name": cfg.exp_name,
         "config": cfg.to_dict(),
@@ -355,18 +432,27 @@ def main() -> None:
         "total_params": total,
         "trainable_params": trainable,
         "gradient_checkpointing_active": ckpt_active,
+        "distributed": {
+            "enabled": ctx.enabled,
+            "backend": ctx.backend,
+            "world_size": ctx.world_size,
+            "sync_bn": sync_bn_active,
+            # 全局等效 batch = 本地 micro batch × 梯度累积 × 进程数
+            "global_effective_batch_size": cfg.effective_batch_size * ctx.world_size,
+        },
         "best_val_acc": best_val_acc,
         "test_acc": test_stats["acc"],
         "test_loss": test_stats["loss"],
         "total_train_time_sec": round(train_time, 2),
         "peak_vram_gb": round(torch.cuda.max_memory_allocated() / 1024 ** 3, 3)
-        if device == "cuda"
+        if device.startswith("cuda")
         else None,
         "history": history,
     }
-    with (run_dir / "summary.json").open("w", encoding="utf-8") as f:
-        json.dump(summary, f, ensure_ascii=False, indent=2)
-    cfg.to_yaml(run_dir / "config_resolved.yaml")
+    if ctx.is_main:
+        with (run_dir / "summary.json").open("w", encoding="utf-8") as f:
+            json.dump(summary, f, ensure_ascii=False, indent=2)
+        cfg.to_yaml(run_dir / "config_resolved.yaml")
 
     log(f"\n{'=' * 60}")
     log("  训练完成")
@@ -377,7 +463,26 @@ def main() -> None:
     log(f"  产物目录       : {run_dir}")
     log(f"{'=' * 60}\n")
 
-    log_file.close()
+    if log_file is not None:
+        log_file.close()
+
+
+def main() -> None:
+    """真正的入口：`force_utf8_stdout` + 分布式进程组的兜底收尾。
+
+    为什么收尾要放在最外层
+    --------------------
+    训练中途抛异常（OOM、loss 变 NaN、用户 Ctrl-C）时，如果某个 rank 直接死掉
+    而其他 rank 还阻塞在集合通信上，整个作业会一直挂着 —— **不会自己退出**，
+    直到 `ddp_timeout_minutes` 超时。`finally` 里销毁进程组，能让其余进程尽快
+    收到「对端已退出」并报错退出，而不是白等 30 分钟。
+    """
+    force_utf8_stdout()
+    try:
+        run_training()
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
 
 if __name__ == "__main__":

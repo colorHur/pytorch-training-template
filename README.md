@@ -22,7 +22,8 @@
 | **梯度裁剪** | 按全局 L2 范数裁剪，防梯度爆炸 |
 | **显存监控** | 每 epoch 打印当前/峰值显存 |
 | **checkpoint** | 保存最优权重 + 完整训练状态（含配置），支持早停 |
-| **测试 + CI** | 79 个 pytest 用例（CPU 可跑，多平台 CI）；离线合成数据集，秒级验证整条流水线 |
+| **分布式训练 (DDP)** | 同一份 `main.py` 单卡/多卡通用（`torchrun` 自动识别）；数据分片、梯度平均、指标归约、rank0 独占落盘；含不依赖 TCPStore 的启动器 |
+| **测试 + CI** | 110 个 pytest 用例（CPU 可跑，多平台 CI）；离线合成数据集，秒级验证整条流水线 |
 
 ## 目录结构
 
@@ -30,16 +31,20 @@
 pytorch-training-template/
 ├── src/
 │   ├── config.py      # 配置系统：dataclass + YAML + 命令行覆盖
-│   ├── data.py        # 数据加载：Dataset / DataLoader / transform
+│   ├── data.py        # 数据加载：Dataset / DataLoader / transform + 分布式切分
 │   ├── model.py       # 模型定义 + 注册表（small_cnn / mlp）+ 梯度检查点
+│   ├── distributed.py # ⭐ DDP：进程组 / 数据切分 / 指标归约 / 模型包装
 │   ├── train.py       # ⭐ 训练循环核心：手写 step / 评测 / LR 调度
-│   └── main.py        # 入口：argparse + 日志 + checkpoint + 显存统计
+│   └── main.py        # 入口：argparse + 日志 + checkpoint + 显存统计 + DDP
 ├── configs/
 │   └── mnist.yaml     # MNIST 标准配置
 ├── experiments/
 │   ├── exp_memory_accounting.py       # 显存账对照实验（7 个变体）
-│   └── exp_checkpoint_granularity.py  # 梯度检查点单步拆解（显存 + 耗时）
-├── tests/             # pytest：配置 / 数据 / 模型 / 训练循环 / 端到端
+│   ├── exp_checkpoint_granularity.py  # 梯度检查点单步拆解（显存 + 耗时）
+│   └── exp_ddp_equivalence.py         # DDP 等价性与吞吐实测
+├── tools/
+│   └── ddp_launch.py  # 用 FileStore 启动 DDP（绕开 TCPStore，Windows 也能跑）
+├── tests/             # pytest：配置 / 数据 / 模型 / 训练循环 / 分布式 / 端到端
 ├── .github/workflows/ci.yml           # 多平台 CI：lint + 测试（CPU）
 ├── outputs/           # 训练产物（git 忽略）
 ├── pyproject.toml     # ruff 与 pytest 配置
@@ -82,6 +87,9 @@ python src/main.py --config configs/mnist.yaml \
 # 梯度检查点（用计算换显存，模型不支持时会明确提示而不是静默忽略）
 python src/main.py --config configs/mnist.yaml --gradient_checkpointing
 
+# 分布式训练（多进程）—— 同一份代码，torchrun 会自动识别
+torchrun --nproc_per_node=4 src/main.py --config configs/mnist.yaml
+
 # 纯命令行（不用配置文件）
 python src/main.py --exp_name quicktest --epochs 1
 ```
@@ -97,19 +105,27 @@ python experiments/exp_memory_accounting.py --report_only
 
 # 梯度检查点的单步拆解（显存 + 耗时）
 python experiments/exp_checkpoint_granularity.py
+
+# DDP 等价性与吞吐（数学部分秒级；多进程计时约 1 分钟）
+python experiments/exp_ddp_equivalence.py --math_only
+python experiments/exp_ddp_equivalence.py
 ```
 
-输出 `outputs/exp_memory/memory_accounting.md` 与 `outputs/exp_ckpt_granularity/checkpoint_granularity.md`。
+输出 `outputs/exp_memory/memory_accounting.md`、`outputs/exp_ckpt_granularity/checkpoint_granularity.md`
+与 `outputs/exp_ddp/ddp_equivalence.md`。
 
 ### 4. 跑测试
 
 ```bash
 pip install -r requirements-dev.txt
-pytest                                    # 79 个用例，CPU 上约 1 分钟
-ruff check src experiments tests          # lint
+pytest                                    # 110 个用例，CPU 上约 1.5 分钟
+ruff check src experiments tests tools    # lint
 
 # 不想等下载？用内置的合成数据集跑通整条流水线
 python src/main.py --dataset synthetic --epochs 1
+
+# 手动起 2 个进程试 DDP（用 FileStore，不需要 torchrun）
+python tools/ddp_launch.py --nproc_per_node 2 -- src/main.py --dataset synthetic --epochs 1 --device cpu
 ```
 
 测试**不需要 GPU、不需要下载任何数据**（内置 `--dataset synthetic` 离线合成数据集），
@@ -123,6 +139,7 @@ python src/main.py --dataset synthetic --epochs 1
 | `tests/test_data.py` | 验证集切分无重叠、meta 与模型匹配、合成数据真的可分 |
 | `tests/test_model.py` | 输入尺寸推算、参数量、**检查点不改变梯度**、BN 双倍更新（canary） |
 | `tests/test_train.py` | LR 调度取值、**更新次数 = ⌈批次数 / 累积步数⌉**、`no_grad` 生效、loss 真的会降 |
+| `tests/test_distributed.py` | **DDP 梯度等价性（含 BN 反例）**、各 rank 切分不重不漏、`set_epoch` 真的换了顺序、`ctx=None` 判空约定 |
 | `tests/test_smoke.py` | 真实 CLI 端到端跑通 + 产物落盘 + 命令行覆盖生效 + **非 UTF-8 输出编码下中文日志不崩** |
 
 两条值得单独说的测试思路：
@@ -155,6 +172,27 @@ python src/main.py --dataset synthetic --epochs 1
    验证时我特意把修复摘掉跑了一遍，确认它确实会红 —— 测试必须能抓到 bug 才算测试。
    > 面试点：这类"本地绿、CI 红"的故障，根因通常是**环境差异**（locale / 编码 / 路径分隔符 /
    > 大小写敏感），而不是逻辑。定位手法是对着 CI 的环境变量在本地重建同等条件。
+
+### 加 DDP 时，测试又挡下来三次
+
+同一套测试在**写新功能时**的价值更明显 —— 它挡住的不只是别人的 bug：
+
+1. **`SyncBatchNorm` 只在 CUDA 上可用**。`convert_sync_batchnorm()` 只换模块类型、
+   **不会报错**，但换成之后 CPU 上第一次前向就抛
+   `ValueError: SyncBatchNorm expected input tensor to be on GPU or XPU`。
+   也就是说「CPU 多进程 + `--sync_bn`」会表现为"配置看起来生效了、训练第一步才崩"。
+   已改为按 backend 判定：只有 nccl 才允许转换，gloo 下明确提示并忽略。
+2. **`ctx=None` 把 12 个已有测试一次性打挂**。`train.py` 的公开 API 约定 `ctx=None` = 单进程，
+   但新写的 `ddp_no_sync()` 里是裸的 `ctx.enabled` → `AttributeError`，
+   而且报错发生在**训练循环中间**。修法不是就地补判空，而是抽出 `is_enabled(ctx)`
+   把判定收敛到一处，再补一条 `test_all_helpers_accept_none_ctx` 把这个约定钉死。
+3. **`evaluate()` 差点把空 loader 的报错吃掉**。为了给 `total` 做类型转换顺手写了
+   `max(1.0, total)` —— 于是空 loader 从"抛 `ZeroDivisionError`"变成"静默返回 acc=0"。
+   已有的 `test_evaluate_on_empty_loader_raises_rather_than_silently_returning_garbage`
+   立刻变红。静默返回 0 会被误读成"模型全错"，比崩溃难查得多，已改回。
+
+> 这三条的共性是：**都不会在"跑一下试试"时暴露**。第 1 条要跑到 CPU 多进程才炸，
+> 第 2 条只在特定调用路径上炸，第 3 条最隐蔽 —— 它"看起来能跑"，只是结果悄悄错了。
 
 ## 实测基准
 
@@ -248,6 +286,95 @@ A 与 D 唯一差别是检查点开关（同 seed、同数据顺序、同超参�
 > MNIST 显存基数只有 0.1GB 量级，绝对差值看着不大但**比例与趋势是可信的**。
 > 生产级场景（ImageNet / Transformer）显存基数在 GB 量级，同样的比例就是省几个 GB。
 
+## 分布式训练（DDP）
+
+同一份 `main.py`，单进程和多进程都能跑 —— 靠 `torchrun` 写进环境变量的
+`RANK` / `LOCAL_RANK` / `WORLD_SIZE` 自动识别，**不另起 `train_ddp.py`**：
+
+```bash
+# 单卡 / CPU（什么都不用改）
+python src/main.py --dataset synthetic --epochs 3
+
+# 多卡
+torchrun --nproc_per_node=4 src/main.py --epochs 30
+
+# 本仓库自带的启动器（用 FileStore 做 rendezvous，不依赖 TCPStore）
+python tools/ddp_launch.py --nproc_per_node 2 -- src/main.py --epochs 3
+```
+
+### DDP 的全部数学内容，就一条等式
+
+```
+grad(batch 2B)  ==  ( grad(batch B on rank0) + grad(batch B on rank1) ) / 2
+```
+
+实测（`experiments/exp_ddp_equivalence.py`，batch=128 切成两个 64）：
+
+| 模型 | 有 BatchNorm | 最大绝对偏差 | 相对偏差 |
+|------|:---:|---:|---:|
+| `mlp` | 否 | **9.3e-09** | 5.3e-06 |
+| `small_cnn` | 是 | **4.3e-03** | **1.31** |
+
+`mlp` 的偏差落在 float32 浮点误差量级，等式成立；`small_cnn` 的**相对偏差超过 1**
+（比梯度本身的尺度还大），等式彻底不成立。
+
+**为什么 BatchNorm 破坏了它**：BN 在训练态用**当前 batch 的统计量**做归一化 ——
+它在前向里"看得见整批数据"，前向不再逐样本独立。单进程 batch 128 的统计量在 128 条上算，
+两个 rank 各自在 64 条上算，归一化结果不同，梯度自然不同。
+
+**DDP 不会帮你同步这个。** `broadcast_buffers=True`（默认）只是每次前向开始把 rank 0 的
+buffer 广播出去，并没有让统计量变准。要真正等价得换 `SyncBatchNorm`——
+但它**只在 CUDA 上可用**（CPU 前向直接抛 `ValueError: SyncBatchNorm expected input tensor
+to be on GPU or XPU`），所以本仓库按 backend 判定，gloo 下直接拒绝转换并给出提示。
+
+> 顺带解释了为什么大家对这个坑不敏感：Transformer 用 LayerNorm，没有 running stats。
+> **有状态层才是问题所在**（和梯度检查点那个坑同源）。
+
+### CPU 上跑 DDP 会变慢 —— 而且这不是 bug
+
+全局 batch 都对齐到 128，6 个 epoch（CPU + gloo，2 进程）：
+
+| 配置 | 进程数 | 每进程 batch | 训练耗时 | 每 epoch | 相对单进程 |
+|------|:---:|---:|---:|---:|---:|
+| 单进程 | 1 | 128 | 2.85s | 0.475s | 1.0× |
+| DDP 2 进程 | 2 | 64 | 6.72s | 1.12s | **0.42×** |
+
+三个原因：① 模型只有 42 万参数，单步计算量微秒级，而每次 all-reduce 都要走 gloo 的
+socket 通信，通信成本远超计算节省；② CPU 没有算力冗余，2 个进程抢同一批核；
+③ gloo 是为正确性和兼容性设计的，不是为速度（真多卡用 nccl）。
+
+**DDP 真正解决的问题是「放不下」，不是「算得慢」**：全局 batch 大到单卡显存装不下、
+或模型+优化器状态超出单卡显存时，才需要它。换句话说：
+**先用梯度累积 / 混合精度把单卡榨干，再考虑 DDP。**
+
+### 三个必踩的坑（都写进了测试）
+
+| 坑 | 症状 | 处理 |
+|---|---|---|
+| 忘了 `set_epoch(epoch)` | 每个 epoch 的 shuffle 顺序完全一样，等于没打乱 | 每个 epoch 开头调一次 |
+| 各 rank 的 batch 数不相等 | **死锁** —— 快的等慢的，没有任何报错，训练就这么卡住 | 训练集用 `drop_last=True` 的 `DistributedSampler` |
+| 存 checkpoint 没 unwrap | key 变成 `module.blocks.0.0.weight`，单进程加载不了 | 存之前 `unwrap_model()` |
+
+另外两条只影响性能/精度、不会报错的：梯度累积时不用 `model.no_sync()`（结果对，但白通信
+`accum` 倍）；以及只有 rank 0 能写日志和 checkpoint（N 个进程同时写会写坏文件）。
+
+### 关于 `torchrun` 在 Windows 上的坑
+
+标准做法是 `torchrun`，但它要创建一个 **TCPStore**。某些 torch 构建
+（尤其是 Windows 版）**没有编进 libuv**，于是直接报：
+
+```
+DistStoreError: use_libuv was requested but PyTorch was built without libuv support,
+run with USE_LIBUV=0 to disable it
+```
+
+更麻烦的是 `USE_LIBUV=0` **也救不回来** —— 这些构建里 Windows 的 TCPStore 只剩 libuv
+一条实现路径。但集合通信（gloo 的 socket）本身是好的，所以本仓库的
+`tools/ddp_launch.py` 换用 `FileStore`（用一个文件当共享存储）做 rendezvous，
+完全绕开 TCP，Windows 和 Linux 都能跑，CI 的两个平台也覆盖了。
+
+> 真实训练环境（Linux + 多卡）请用 `torchrun`：它带弹性容错和更完善的进程管理。
+
 ## 核心代码位置（想学就看这几个文件）
 
 | 想学什么 | 看哪里 |
@@ -258,6 +385,8 @@ A 与 D 唯一差别是检查点开关（同 seed、同数据顺序、同超参�
 | 配置怎么做到可复现 | `src/config.py` 的 `merge()` / `to_yaml()` |
 | 为什么必须切 `train()`/`eval()` | `src/train.py` 的 `evaluate()` |
 | 验证集为什么必须切 | `src/data.py` 的 `split_train_val()` |
+| **DDP 的进程组 / 数据切分 / 指标归约** | `src/distributed.py`（模块 docstring 列了三个必踩的坑） |
+| `torchrun` 不可用时怎么跑多进程 | `tools/ddp_launch.py`（FileStore rendezvous） |
 
 ## 关键概念速查（面试自测）
 
@@ -310,10 +439,42 @@ Decoupled weight decay——权重衰减不参与 Adam 的动量/二阶矩计算
 反过来，用训练脚本的总耗时（含数据加载与验证）又会把差异稀释到看不见。
 **必须把完整 step 单独拎出来计时。** 结论：检查点的代价基本等于「多跑一次前向」。
 
+**Q13: DDP 的数学内容是什么？为什么不用改模型就能用？**
+就一条：`grad(batch N·B) == mean_r( grad(batch B on rank r) )`。
+每个 rank 在自己那份数据上算梯度，反向时 all-reduce 求**平均**，等价于用了一个 `N·B` 的大 batch。
+不改模型就能用的前提是：损失逐样本可加、且前向没有跨样本耦合（没有 BatchNorm 这类"看整批数据"的层）。
+
+**Q14: 那 BatchNorm 会怎么样？**
+它会打破上面那条等式。BN 训练态用**当前 batch 的统计量**归一化，所以它在前向里"看得见整批数据"：
+单进程 batch 128 的统计量在 128 条上算，2 个 rank 各 64 条的统计量各自在 64 条上算，归一化结果不同，梯度自然不同。
+**DDP 不会同步这个**（`broadcast_buffers` 只是把 rank0 的 buffer 广播出去，没让统计量变准）。
+实测相对偏差 1.31（比梯度尺度还大）。要等价得用 `SyncBatchNorm`，代价是多一次通信，且**只在 CUDA 上可用**。
+→ Transformer 用 LayerNorm 没有 running stats，所以不受影响。
+
+**Q15: DDP 下各 rank 的 batch 数不相等会怎样？**
+**死锁，而且没有任何报错** —— 快的那个在 all-reduce 处等慢的，慢的又不等它，训练就这么卡住。
+所以训练集必须用 `drop_last=True` 的 `DistributedSampler` 保证切分等长。
+排查手段是把 `ddp_timeout_minutes` 调小，让"卡住"尽快变成"报错"。
+
+**Q16: DDP 和梯度累积都做，中间几步要不要用 `no_sync()`？**
+用能省 `accum-1` 倍的通信量，**但不用也不会算错**。
+因为 DDP 的平均是线性的：`Σ_i mean_r(g_i) == mean_r(Σ_i g_i)`。
+所以这是个纯性能优化 —— 面试时如果说成"不加会错"就露馅了。
+
+**Q17: DDP 能让训练变快吗？**
+不一定，在 CPU + 小模型上实测**慢了 2.4 倍**（全局 batch 对齐到 128 时 0.42×）。
+原因是通信开销超过计算节省、CPU 没有算力冗余、gloo 也不是为速度设计的。
+**DDP 真正解决的是「放不下」而不是「算得慢」**：全局 batch 大到单卡显存装不下、
+模型+优化器状态超出单卡显存时才需要它。顺序应该是：先用梯度累积/混合精度/检查点把单卡榨干，再考虑 DDP。
+
+**Q18: 存 DDP 训练出来的 checkpoint 有什么坑？**
+必须 `unwrap_model(model).state_dict()`。直接 `model.state_dict()` 的 key 会带 `module.` 前缀
+（`module.blocks.0.0.weight`），单进程加载时全部对不上 —— 而且**保存时不会有任何提示**，属于埋雷型 bug。
+
 ## 后续可扩展
 
 - [x] `gradient checkpointing` 演示（用计算换显存的量化对比）
-- [ ] 分布式训练（DDP）最小可跑示例
+- [x] 分布式训练（DDP）最小可跑示例 + 等价性/吞吐实测
 - [ ] `torch.compile` 加速对比
 - [ ] 学习率 finder（LR range test）
 

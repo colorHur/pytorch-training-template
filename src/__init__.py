@@ -6,6 +6,7 @@ import sys
 
 from src.config import TrainConfig
 from src.data import build_dataloaders
+from src.distributed import DistContext, reduce_sums, setup_distributed, wrap_model
 from src.model import build_model, count_parameters
 from src.train import build_lr_scheduler, evaluate, train_one_epoch
 
@@ -18,6 +19,10 @@ __all__ = [
     "evaluate",
     "train_one_epoch",
     "force_utf8_stdout",
+    "DistContext",
+    "reduce_sums",
+    "setup_distributed",
+    "wrap_model",
 ]
 
 __version__ = "1.0.0"

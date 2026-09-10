@@ -25,6 +25,8 @@ import torch
 from torch.utils.data import DataLoader, Dataset, random_split
 from torchvision import datasets, transforms
 
+from src.distributed import build_eval_sampler, build_train_sampler
+
 # ---- 各数据集的归一化统计量 ----
 # image_size 供模型推算全连接层输入维度（池化两次 → image_size // 4）
 DATASET_STATS = {
@@ -161,22 +163,51 @@ def build_dataloaders(
     num_workers: int = 0,
     seed: int = 42,
     pin_memory: bool = True,
+    ctx=None,
 ):
     """一步到位建好 train / val / test 三个 DataLoader。
 
-    pin_memory=True 会把 batch 放进页锁定内存，H2D 拷贝更快（仅 CUDA 有意义）。
+    `pin_memory=True` 会把 batch 放进页锁定内存，H2D 拷贝更快（仅 CUDA 有意义）。
+
+    分布式的两条不同策略（`ctx` 为 `DistContext`，单进程时不传即可）
+    ------------------------------------------------------------
+    - **训练集分片**：用 `DistributedSampler`，每个 rank 只看自己那份。
+      不分片的话每个 rank 都在学同一批数据 —— 跑起来了，但完全没提速，
+      梯度还被平均成了"等于单卡用小 batch"，是 DDP 最典型的假成功。
+    - **验证/测试集也分片，但用 `StridedSampler`**：
+      不能重复样本（会造成指标虚高），长度差 1 以内，靠 `evaluate()` 里的
+      all-reduce 汇总成全局指标。
+
+    ⚠️ 切分训练/验证集用的 `seed` 在**所有 rank 上必须相同**。
+       否则每个 rank 切出的验证集都不一样，指标根本对不上。
+       `split_train_val` 用的是传入的 `seed`，调用方不要按 rank 去偏移它。
     """
     train_full, test_set = build_datasets(dataset_name, data_dir)
     train_set, val_set = split_train_val(train_full, val_ratio, seed)
 
+    train_sampler = val_sampler = test_sampler = None
+    if ctx is not None and ctx.enabled:
+        train_sampler = build_train_sampler(train_set, ctx, seed=seed)
+        val_sampler = build_eval_sampler(val_set, ctx)
+        test_sampler = build_eval_sampler(test_set, ctx)
+
     common = dict(num_workers=num_workers, pin_memory=pin_memory, drop_last=False)
-    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, **common)
-    val_loader = DataLoader(val_set, batch_size=batch_size * 2, shuffle=False, **common)
-    test_loader = DataLoader(test_set, batch_size=batch_size * 2, shuffle=False, **common)
+    # 注意 drop_last 交给 sampler 控制（sampler.drop_last=True），DataLoader 保持 False
+    train_loader = DataLoader(
+        train_set, batch_size=batch_size, shuffle=(train_sampler is None),
+        sampler=train_sampler, **common,
+    )
+    val_loader = DataLoader(
+        val_set, batch_size=batch_size * 2, shuffle=False, sampler=val_sampler, **common
+    )
+    test_loader = DataLoader(
+        test_set, batch_size=batch_size * 2, shuffle=False, sampler=test_sampler, **common
+    )
 
     return {
         "train": train_loader,
         "val": val_loader,
         "test": test_loader,
         "meta": DATASET_STATS[dataset_name],
+        "samplers": {"train": train_sampler, "val": val_sampler, "test": test_sampler},
     }
