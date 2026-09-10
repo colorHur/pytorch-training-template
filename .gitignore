@@ -1,0 +1,25 @@
+# ---- 数据与产物 ----
+data/
+outputs/
+*.pt
+*.pth
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+
+# ---- IDE ----
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# ---- 日志 ----
+*.log

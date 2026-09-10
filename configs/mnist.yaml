@@ -1,0 +1,33 @@
+# MNIST 标准训练配置（基准：3 epoch 应达到 ~98% val_acc）
+
+exp_name: mnist_cnn
+seed: 42
+output_dir: outputs
+
+dataset: mnist
+data_dir: data
+num_workers: 0
+val_ratio: 0.1
+
+model: small_cnn
+num_classes: 10
+in_channels: 1
+
+epochs: 3
+batch_size: 128
+grad_accum_steps: 1
+lr: 0.001
+weight_decay: 0.0001
+optimizer: adamw
+lr_scheduler: cosine
+warmup_steps: 0
+max_grad_norm: 0.0
+
+amp: false
+channels_last: false
+
+log_interval: 50
+save_every_epoch: false
+early_stop_patience: 0
+
+device: auto

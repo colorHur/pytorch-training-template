@@ -1,0 +1,11 @@
+# PyTorch 训练模板 · 实测依赖版本（2026-09-10）
+# 注意：torch 需按 CUDA 版本从专用源安装，见 README
+torch==2.11.0+cu128
+torchvision==0.26.0+cu128
+
+# 配置与实验管理
+pyyaml>=6.0
+
+# 数据集下载（torchvision 依赖，显式列出以固定版本）
+numpy>=1.26
+pillow>=10.0
