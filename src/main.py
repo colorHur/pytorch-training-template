@@ -32,6 +32,7 @@ import torch.nn as nn
 # 让 `python src/main.py` 和 `python -m src.main` 都能跑
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from src import force_utf8_stdout
 from src.config import TrainConfig
 from src.data import build_dataloaders
 from src.model import build_model, count_parameters, enable_gradient_checkpointing
@@ -163,6 +164,12 @@ def parse_args() -> argparse.Namespace:
 # 主流程
 # ============================================================
 def main() -> None:
+    # 第一件事就把输出编码钉死成 UTF-8。
+    # 这条日志全是中文，而 Windows 上输出到管道时 Python 用系统 locale 编码
+    # （英文系统 = cp1252），不设就会 UnicodeEncodeError 把整个训练带崩。
+    # 终端 / 本机是中文 locale 时永远复现不了 —— 典型 CI-only 故障。
+    force_utf8_stdout()
+
     args = parse_args()
 
     # ---- 组装配置：YAML -> 命令行覆盖 ----

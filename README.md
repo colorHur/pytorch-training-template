@@ -22,7 +22,7 @@
 | **梯度裁剪** | 按全局 L2 范数裁剪，防梯度爆炸 |
 | **显存监控** | 每 epoch 打印当前/峰值显存 |
 | **checkpoint** | 保存最优权重 + 完整训练状态（含配置），支持早停 |
-| **测试 + CI** | 78 个 pytest 用例（CPU 可跑，多平台 CI）；离线合成数据集，秒级验证整条流水线 |
+| **测试 + CI** | 79 个 pytest 用例（CPU 可跑，多平台 CI）；离线合成数据集，秒级验证整条流水线 |
 
 ## 目录结构
 
@@ -105,7 +105,7 @@ python experiments/exp_checkpoint_granularity.py
 
 ```bash
 pip install -r requirements-dev.txt
-pytest                                    # 78 个用例，CPU 上约 1 分钟
+pytest                                    # 79 个用例，CPU 上约 1 分钟
 ruff check src experiments tests          # lint
 
 # 不想等下载？用内置的合成数据集跑通整条流水线
@@ -123,7 +123,7 @@ python src/main.py --dataset synthetic --epochs 1
 | `tests/test_data.py` | 验证集切分无重叠、meta 与模型匹配、合成数据真的可分 |
 | `tests/test_model.py` | 输入尺寸推算、参数量、**检查点不改变梯度**、BN 双倍更新（canary） |
 | `tests/test_train.py` | LR 调度取值、**更新次数 = ⌈批次数 / 累积步数⌉**、`no_grad` 生效、loss 真的会降 |
-| `tests/test_smoke.py` | 真实 CLI 端到端跑通 + 产物落盘 + 命令行覆盖生效 |
+| `tests/test_smoke.py` | 真实 CLI 端到端跑通 + 产物落盘 + 命令行覆盖生效 + **非 UTF-8 输出编码下中文日志不崩** |
 
 两条值得单独说的测试思路：
 
@@ -132,9 +132,9 @@ python src/main.py --dataset synthetic --epochs 1
 - **BN 双倍更新写成 canary 测试**。它断言的是**现状**而非"正确行为"，这是故意的：
   上游哪天修好了，测试会告警，提醒把 README 一起改掉，而不是让文档悄悄过时。
 
-### 写测试当场抓到的三个真 bug
+### 写测试当场抓到的四个真 bug
 
-这轮加测试不是走过场，跑起来立刻暴露了三个问题：
+这轮加测试不是走过场，跑起来立刻暴露了四个问题（第四个是 CI 抓的）：
 
 1. **`small_cnn` 的全连接层输入维度写死 7×7** → `--dataset cifar10`（32×32 池化两次是 8×8）
    会直接 shape mismatch 崩掉。README 一直宣称支持 CIFAR-10，实际跑不通。
@@ -144,6 +144,17 @@ python src/main.py --dataset synthetic --epochs 1
    随后 `get_device_name(0)` 抛 `Invalid device id`。已改为两个条件都查，且探测异常时退回 CPU。
 3. **`--amp --device cpu` 会抛异常**，而不是走那段"优雅关闭混合精度"的提示 ——
    因为 config 的校验在合并配置时就先炸了，提示代码根本不可达。已改为预先化解冲突。
+4. **中文日志在英文 Windows 上直接把训练带崩**。Python 输出到**管道**时用系统 locale 编码
+   （英文系统是 cp1252），`print("训练完成")` 抛 `UnicodeEncodeError: 'charmap' codec ...`，
+   exit code 1。这个 bug **本地永远复现不了**：终端自己会处理编码，而且本机是 cp936 能编码中文，
+   所以当时 78 个测试全绿、只有 CI 的 windows job 红。
+   修法是在 `main()` 最开头调 `force_utf8_stdout()`，并把管道编码钉成 UTF-8。
+
+   顺带说，第 4 个 bug 也催生了一条特殊测试：`test_chinese_log_survives_non_utf8_stdout`
+   用 `PYTHONIOENCODING=cp1252` 起子进程，**等价复现 CI 的 locale**。
+   验证时我特意把修复摘掉跑了一遍，确认它确实会红 —— 测试必须能抓到 bug 才算测试。
+   > 面试点：这类"本地绿、CI 红"的故障，根因通常是**环境差异**（locale / 编码 / 路径分隔符 /
+   > 大小写敏感），而不是逻辑。定位手法是对着 CI 的环境变量在本地重建同等条件。
 
 ## 实测基准
 

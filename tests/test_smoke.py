@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -21,8 +22,11 @@ MAIN = ROOT / "src" / "main.py"
 CONFIG = ROOT / "configs" / "mnist.yaml"
 
 
-def run_main(tmp_path: Path, *extra: str, exp_name: str = "e2e"):
-    """跑一次 main.py，返回 (完成后的进程, 输出目录)。"""
+def run_main(tmp_path: Path, *extra: str, exp_name: str = "e2e", env: dict | None = None):
+    """跑一次 main.py，返回 (完成后的进程, 输出目录)。
+
+    `env` 会叠加在当前环境上（而不是替换），方便构造"换个 locale"的场景。
+    """
     out_dir = tmp_path / "outputs"
     cmd = [
         sys.executable, str(MAIN),
@@ -33,9 +37,10 @@ def run_main(tmp_path: Path, *extra: str, exp_name: str = "e2e"):
         "--num_workers", "0",
         *extra,
     ]
+    full_env = {**os.environ, **(env or {})}
     proc = subprocess.run(
         cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
-        cwd=str(ROOT),
+        cwd=str(ROOT), env=full_env,
     )
     return proc, out_dir / exp_name
 
@@ -154,3 +159,35 @@ def test_overrides_beat_config_file(tmp_path):
     assert proc.returncode == 0, proc.stdout[-2000:]
     cfg = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))["config"]
     assert (cfg["epochs"], cfg["batch_size"], cfg["lr"]) == (2, 64, 5e-4)
+
+
+# ============================================================
+# 输出编码：一个"本地永远复现不了"的 CI-only 故障
+# ============================================================
+def test_chinese_log_survives_non_utf8_stdout(tmp_path):
+    """中文日志在非 UTF-8 的输出编码下也必须能打印出来。
+
+    真实故障复盘
+    ------------
+    Python 在 Windows 上**输出到管道**时用系统 locale 编码，英文系统 = cp1252。
+    `print("训练完成")` 于是抛 `UnicodeEncodeError: 'charmap' codec ...`，
+    整个训练脚本带着 exit code 1 崩掉 —— 而这种崩溃只发生在
+    「管道 / 重定向 / CI」场景。本地终端是 cp936（中文 locale），
+    能正常编码中文，所以**本地怎么跑都是绿的**，只有 GitHub Actions 的
+    windows runner 会红。
+
+    这里用 `PYTHONIOENCODING` 把子进程的输出编码强制成 cp1252，等价复现
+    CI 环境。只要 `main.py` 开头的 `force_utf8_stdout()` 被删掉，这条测试
+    立刻变红 —— 这就是它的存在意义。
+    """
+    proc, _ = run_main(
+        tmp_path, "--epochs", "1", "--batch_size", "128",
+        exp_name="e2e_encoding",
+        env={"PYTHONIOENCODING": "cp1252"},
+    )
+    assert proc.returncode == 0, (
+        "非 UTF-8 输出编码下训练崩溃了 —— 大概率是 force_utf8_stdout() 没被调用\n"
+        f"{proc.stdout[-2000:]}\n{proc.stderr[-2000:]}"
+    )
+    assert "UnicodeEncodeError" not in proc.stderr
+    assert "训练完成" in proc.stdout          # 中文确实完整写出来了
