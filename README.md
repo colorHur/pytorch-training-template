@@ -2,7 +2,10 @@
 
 一套**手写、不含高层封装**的 PyTorch 训练脚手架。目的是把训练循环的每个细节讲清楚——而不是调一个 `Trainer` 就完事。
 
-> 为什么手写？面试问的是 `optimizer.zero_grad()` 为什么必须在 `backward()` 之前、梯度累积怎么省显存、`GradScaler` 解决什么问题。这些被封装的 API 挡住了。
+> 为什么手写？面试问的是 `optimizer.zero_grad()` 为什么必须在 `backward()` 之前、梯度累积怎么省显存、`GradScaler` 解决什么问题、梯度检查点省的是哪部分显存。这些被封装的 API 挡住了。
+
+这个仓库不只是「能跑」——**每个显存优化手段都配了实测数据**（7 个对照变体 + 单步拆解），
+包括一个实测抓出来的反直觉结论：梯度检查点把前向保活的激活砍掉 83%，训练峰值却只降 13%。
 
 ## 特性
 
@@ -12,6 +15,7 @@
 | **手写训练循环** | 不用 Lightning/Trainer，每一步（清零→前向→反向→裁剪→更新）都显式写出 |
 | **梯度累积** | 小显存跑等效大 batch，显存不增长 |
 | **混合精度** | `torch.autocast` + `GradScaler`，含梯度还原时机 |
+| **梯度检查点** | 不保存块内激活、反向重算，用计算换显存；含 BN 统计量陷阱的处理说明 |
 | **手写 LR 调度** | warmup + cosine/step，能看到 lr 每一步怎么变（不是黑盒 `scheduler.step()`） |
 | **梯度裁剪** | 按全局 L2 范数裁剪，防梯度爆炸 |
 | **显存监控** | 每 epoch 打印当前/峰值显存 |
@@ -24,13 +28,14 @@ pytorch-training-template/
 ├── src/
 │   ├── config.py      # 配置系统：dataclass + YAML + 命令行覆盖
 │   ├── data.py        # 数据加载：Dataset / DataLoader / transform
-│   ├── model.py       # 模型定义 + 注册表（small_cnn / mlp）
+│   ├── model.py       # 模型定义 + 注册表（small_cnn / mlp）+ 梯度检查点
 │   ├── train.py       # ⭐ 训练循环核心：手写 step / 评测 / LR 调度
 │   └── main.py        # 入口：argparse + 日志 + checkpoint + 显存统计
 ├── configs/
 │   └── mnist.yaml     # MNIST 标准配置
 ├── experiments/
-│   └── exp_memory_accounting.py   # 显存账对照实验
+│   ├── exp_memory_accounting.py       # 显存账对照实验（7 个变体）
+│   └── exp_checkpoint_granularity.py  # 梯度检查点单步拆解（显存 + 耗时）
 ├── outputs/           # 训练产物（git 忽略）
 └── requirements.txt
 ```
@@ -51,7 +56,8 @@ pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
 pip install -r requirements.txt
 ```
 
-> 国内网络可用镜像加速，见 `docs/` 或 diffusers 项目的踩坑记录。
+> 国内网络可用镜像加速：PyPI 换阿里云源、torch 的 CUDA 轮子换高校镜像源，
+> 能明显快于官方源。本项目在阿里云 PyPI + 镜像 torch 轮子下安装完成。
 
 ### 2. 训练
 
@@ -66,6 +72,9 @@ python src/main.py --config configs/mnist.yaml --epochs 5 --lr 5e-4
 python src/main.py --config configs/mnist.yaml \
     --batch_size 64 --grad_accum_steps 4 --amp
 
+# 梯度检查点（用计算换显存，模型不支持时会明确提示而不是静默忽略）
+python src/main.py --config configs/mnist.yaml --gradient_checkpointing
+
 # 纯命令行（不用配置文件）
 python src/main.py --exp_name quicktest --epochs 1
 ```
@@ -73,10 +82,17 @@ python src/main.py --exp_name quicktest --epochs 1
 ### 3. 显存账对照实验
 
 ```bash
+# 7 个变体全跑（约 6 分钟）
 python experiments/exp_memory_accounting.py --epochs 2
+
+# 只改了报告文案、想重出报告时用（复用上次结果，不重新训练）
+python experiments/exp_memory_accounting.py --report_only
+
+# 梯度检查点的单步拆解（显存 + 耗时）
+python experiments/exp_checkpoint_granularity.py
 ```
 
-输出 `outputs/exp_memory/memory_accounting.md`，用实测数据说明梯度累积和混合精度各能省多少显存。
+输出 `outputs/exp_memory/memory_accounting.md` 与 `outputs/exp_ckpt_granularity/checkpoint_granularity.md`。
 
 ## 实测基准
 
@@ -89,29 +105,94 @@ python experiments/exp_memory_accounting.py --epochs 2
 | 3 epoch / batch=128 / AdamW / cosine | **~98.8%** | ~45s | 0.08 GB |
 | 1 epoch / batch=128（冒烟测试） | 98.52% | 16.0s | 0.08 GB |
 
-### 显存账对照实验（2 epoch / batch=256 等效）
+### 显存账对照实验（2 epoch / 等效 batch 256）
 
-| 变体 | micro batch | 累积步数 | 等效 batch | 峰值显存 | 测试准确率 |
-|------|------------|---------|-----------|---------|-----------|
-| A. 基准 | 256 | 1 | 256 | 0.138 GB | 0.9867 |
-| **B. 梯度累积** | **64** | **4** | **256** | **0.052 GB** | **0.9869** |
-| C. 混合精度 | 256 | 1 | 256 | 0.129 GB | 0.9876 |
+| 变体 | micro batch | 累积步数 | 检查点 | 等效 batch | 峰值显存 | 相对基准 | 测试准确率 |
+|------|------------|---------|-------|-----------|---------|---------|-----------|
+| A. 基准 | 256 | 1 | — | 256 | 0.138 GB | — | 0.9867 |
+| **B. 梯度累积** | **64** | **4** | — | **256** | **0.052 GB** | **-62%** | 0.9870 |
+| C. 混合精度 | 256 | 1 | — | 256 | 0.129 GB | -7% | 0.9876 |
+| D. 梯度检查点 | 256 | 1 | ✅ | 256 | 0.127 GB | -8% | 0.9862 |
+| E. 累积 + 检查点 | 64 | 4 | ✅ | 256 | 0.053 GB | -62% | 0.9870 |
 
-**结论**：
-1. **梯度累积省显存 62%**（0.138 → 0.052 GB），等效 batch 和准确率都不变。
-   原因：显存大头是**激活值**，正比于单次前向的样本数。梯度累积每次只前向 64 个样本，攒 4 次梯度再更新，数学上等效 batch=256，但激活值只需 1/4。
-2. **混合精度省显存 7%**（0.138 → 0.129 GB）——MNIST 模型太小，效果不明显。大模型上激活值占主导时收益显著。
-3. **准确率不受影响**：三种配置差异在 0.001 以内，省显存不以牺牲效果为代价。
+**四条结论**：
 
-> MNIST 太简单，显存基数本来就小（0.1GB 量级），绝对差值看起来不大但**比例很有说服力**。
+1. **梯度累积是最划算的一招**：等效 batch 不变、显存降 **62%**，几乎零代价。
+   显存大头是**激活值**，正比于单次前向的样本数；累积每次只前向 64 个，激活只需 ¼。
+2. **混合精度降 7%** —— 这个数字偏小是小模型的必然：显存基数只有 0.1GB 量级，
+   激活值本来就不占主导。模型越大、激活占比越高，收益越接近理论值（激活直接减半）。
+3. **梯度检查点只降 8%** —— 不是实现有问题，原因见下节，是个值得单独理解的反直觉点。
+4. **三种手段可以叠加**（E），且准确率均不受影响（各变体差异 ≤0.001）。
+
+### 梯度检查点为什么只省 8%？
+
+`exp_checkpoint_granularity.py` 把单个训练 step 拆成三个时间点量（batch=256）：
+
+| 粒度 | 前向保活的激活 | 前向峰值 | 全程峰值 | 完整 step 耗时 |
+|------|--------------|---------|---------|--------------|
+| 不开检查点 | 111 MB | 117 MB | 138 MB | 5.5 ms |
+| **按 block 检查点** | **19 MB** | **51 MB** | 119 MB | 8.3 ms |
+| 整条主干当一个段 | 13 MB | 51 MB | 138 MB | 8.0 ms |
+
+**三个反直觉的点**：
+
+- **省的是「前向保活的激活」，不是「峰值」**。检查点把保活量砍掉 83%、前向峰值腰斩，
+  但训练全程峰值由**反向阶段**决定 —— 重算会把激活重新物化出来，卷积反向的 workspace 也照付。
+  所以净收益只剩 13%。**激活「驻留规模」≠ 峰值「瞬时规模」。**
+- **粒度选错，收益直接归零**。把整条主干当成一个检查点段时，没有边界可以逐段释放，
+  反向重算会一次性全量物化 —— 峰值与不开检查点持平。所以粒度要落在「块」上（Transformer 的一层 / CNN 的一个卷积单元）。
+- **耗时要测完整 step**。前向耗时几乎没变（重算发生在反向阶段，前向计时里看不到），
+  完整 step 5.5 → 8.3 ms（+40~50%），增量正好是一次前向的量级 ——
+  **检查点的代价基本就是「多跑一次前向」。**
+
+> **判据是「激活值占总显存的比例」，不是模型大小。**
+> 把 micro batch 从 256 放大到 1024（激活值 ×4），检查点收益从 8% 涨到 **14%**（见实验里的 F/G 变体）。
+
+### ⚠️ 一个被实测抓出来的坑：检查点会让 BatchNorm 统计量更新两次
+
+A 与 D 唯一差别是检查点开关（同 seed、同数据顺序、同超参），逐层验证：
+
+| 检查项 | 结果 |
+|--------|------|
+| loss | 完全相同（小数点后 8 位一致） |
+| 全部参数梯度 | **逐元素完全相同**（maxdiff = 0.0） |
+| `num_batches_tracked` | 1 vs **2** ❌ |
+| `running_mean` | 偏离约 0.024 ❌ |
+
+检查点在反向时会把 block 重新前向一遍来重算激活。**重算本身是精确的**（所以梯度逐元素一致），
+但训练态 BatchNorm 的 forward **带副作用** —— 它用当前 batch 的统计量更新 running stats，
+重算一次就多更新一次。梯度没事是因为训练态 BN 归一化用的是 batch 统计量；
+但 eval 用的是 running stats，统计量偏了指标就跟着偏（本例约 -0.05 pp）。
+
+**为什么 LLM 训练开检查点毫无顾虑**：Transformer 用 LayerNorm，没有 running stats，
+重算是纯函数。**有状态层才是问题所在。**
+
+缓解手段：块内改用无状态归一化（GroupNorm / LayerNorm），或把 BN 排除在检查点块之外。
+
+### 显存不够时的决策阶梯
+
+| 顺序 | 手段 | 实测省多少 | 额外代价 |
+|------|------|-----------|---------|
+| 1️⃣ | **梯度累积** | **62%** | 几乎为零 —— 默认先上 |
+| 2️⃣ | **混合精度** | 7%（大模型更高） | 需 GradScaler |
+| 3️⃣ | **梯度检查点** | 8%（大 batch 下 14%） | step 慢 40~50% |
+| 4️⃣ | 组合使用 | 62% | 真的塞不下时的兜底 |
+
+关键认知：训练显存 = 参数 + 梯度 + 优化器状态 + **激活值**。
+前三项与 batch size 无关，只有激活值随 batch 线性增长 —— 所以它通常是最大头，
+也是上面三招**唯一能打**的目标。再往上还有 8-bit 优化器、ZeRO / FSDP、CPU offload，
+但那些是「实在不够」的手段，前三级能解决就别上。
+
+> MNIST 显存基数只有 0.1GB 量级，绝对差值看着不大但**比例与趋势是可信的**。
 > 生产级场景（ImageNet / Transformer）显存基数在 GB 量级，同样的比例就是省几个 GB。
 
-## 核心代码位置（想学就看这三个文件）
+## 核心代码位置（想学就看这几个文件）
 
 | 想学什么 | 看哪里 |
 |---------|-------|
 | 训练 step 的完整顺序 | `src/train.py` 的 `train_one_epoch()` |
 | 显存优化的每一项 | `src/train.py` 模块 docstring + `src/main.py` 的 `build_optimizer()` |
+| **梯度检查点怎么实现、坑在哪** | `src/model.py` 的 `SmallCNN.forward()` docstring |
 | 配置怎么做到可复现 | `src/config.py` 的 `merge()` / `to_yaml()` |
 | 为什么必须切 `train()`/`eval()` | `src/train.py` 的 `evaluate()` |
 | 验证集为什么必须切 | `src/data.py` 的 `split_train_val()` |
@@ -144,9 +225,32 @@ Decoupled weight decay——权重衰减不参与 Adam 的动量/二阶矩计算
 **Q8: warmup 为什么需要？**
 训练初期参数随机、梯度方向噪声大，大 lr 会破坏预训练权重或让模型发散。warmup 让 lr 从 0 线性升到目标值，平滑起步。对 Transformer 尤其重要。
 
+**Q9: 梯度检查点省的是哪部分显存？为什么"省了 83% 激活"却只让峰值降 13%？**
+省的是**前向保活的中间激活**（反向要用、必须存到反向结束的那些张量）。但因为：
+① 反向重算时激活会被**重新物化**，那一刻照样占显存 —— 省掉的是激活"同时活着"的时间跨度，不是"总分配量"；
+② 反向还有与检查点无关的开销（卷积反向的 cuDNN workspace）。
+**峰值由反向阶段的瞬时规模决定**，所以收益会大幅缩水。判据是"激活值占总显存的比例"，不是模型大小。
+
+**Q10: 检查点的粒度为什么不能随便选？**
+检查点靠**边界**把激活切段、逐段释放。粒度太细（每层都 checkpoint）→ 每层都要存自己的输入，等于没省；
+粒度太粗（整条主干当一个段）→ 反向重算时一次性全量物化，没有释放点，收益直接归零（实测峰值与不开检查点持平）。
+正确粒度是"块"：Transformer 的一层、CNN 的一个卷积单元。
+
+**Q11: 检查点对 BatchNorm 有什么影响？**
+会**双倍更新 running stats**。因为重算时 block 又被前向了一遍，而训练态 BN 的 forward 带副作用（用当前 batch 统计量更新 running stats）。
+注意：**梯度不受影响**（逐元素完全一致，实测 maxdiff = 0.0），因为训练态 BN 归一化用的是 batch 统计量，与 running stats 无关；
+但 eval 会用 running stats，所以指标会偏（本例约 -0.05 pp）。
+`use_reentrant=False` 能修好 Dropout 的 RNG 状态问题，**但挡不住这个**。缓解：块内换 GroupNorm / LayerNorm，或把 BN 排除在检查点块外。
+→ 这也解释了为什么 LLM 训练开检查点毫无顾虑：Transformer 用 LayerNorm，没有 running stats，重算是纯函数。
+
+**Q12: 评估"梯度检查点慢多少"时，测前向耗时够吗？**
+不够，会严重低估。重算发生在**反向阶段**，前向计时里看不到它 —— 实测前向耗时几乎没变，但完整 step 从 5.5ms 涨到 8.3ms（+40~50%）。
+反过来，用训练脚本的总耗时（含数据加载与验证）又会把差异稀释到看不见。
+**必须把完整 step 单独拎出来计时。** 结论：检查点的代价基本等于「多跑一次前向」。
+
 ## 后续可扩展
 
-- [ ] `gradient checkpointing` 演示（用计算换显存的量化对比）
+- [x] `gradient checkpointing` 演示（用计算换显存的量化对比）
 - [ ] 分布式训练（DDP）最小可跑示例
 - [ ] `torch.compile` 加速对比
 - [ ] 学习率 finder（LR range test）

@@ -58,6 +58,7 @@ class TrainConfig:
     # ---- 精度与显存 ----
     amp: bool = False                # 自动混合精度（fp16 + GradScaler）
     channels_last: bool = False      # NHWC 内存布局，卷积上更快
+    gradient_checkpointing: bool = False  # 用计算换显存：反向时重算激活值
 
     # ---- 日志与保存 ----
     log_interval: int = 50           # 每多少 step 打一次日志

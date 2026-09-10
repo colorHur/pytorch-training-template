@@ -34,7 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.config import TrainConfig
 from src.data import build_dataloaders
-from src.model import build_model, count_parameters
+from src.model import build_model, count_parameters, enable_gradient_checkpointing
 from src.train import build_lr_scheduler, evaluate, train_one_epoch
 
 HERE = Path(__file__).resolve().parent.parent
@@ -133,6 +133,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max_grad_norm", type=float, default=None)
     p.add_argument("--amp", action=argparse.BooleanOptionalAction, default=None, help="混合精度")
     p.add_argument("--channels_last", action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument(
+        "--gradient_checkpointing",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="梯度检查点：用多算一次前向换取激活显存",
+    )
     p.add_argument("--log_interval", type=int, default=None)
     p.add_argument("--early_stop_patience", type=int, default=None)
     p.add_argument("--device", type=str, default=None, choices=["auto", "cuda", "cpu"])
@@ -203,6 +209,15 @@ def main() -> None:
     if cfg.channels_last:
         model = model.to(memory_format=torch.channels_last)
 
+    # ---- 梯度检查点（可选项，模型不支持则明确告知而不是静默忽略）----
+    ckpt_active = False
+    if cfg.gradient_checkpointing:
+        ckpt_active = enable_gradient_checkpointing(model)
+        if ckpt_active:
+            log("      梯度检查点：开（反向重算激活，用计算换显存）")
+        else:
+            log(f"      ⚠️  {cfg.model} 未实现梯度检查点，该配置已忽略")
+
     total, trainable = count_parameters(model)
     log(f"      {cfg.model}: 总参数 {total:,} / 可训练 {trainable:,}")
 
@@ -221,7 +236,11 @@ def main() -> None:
         f"[3/5] 优化器 {cfg.optimizer}(lr={cfg.lr}) | 调度器 {cfg.lr_scheduler} | "
         f"warmup {cfg.warmup_steps} | 总更新步数 {total_steps}"
     )
-    log(f"      AMP {'开' if cfg.amp else '关'} | 梯度裁剪 {cfg.max_grad_norm or '关'}")
+    log(
+        f"      AMP {'开' if cfg.amp else '关'} | 梯度裁剪 {cfg.max_grad_norm or '关'} | "
+        f"梯度检查点 {'开' if ckpt_active else '关'}"
+        + ("（配置要求开但模型不支持，已忽略）" if cfg.gradient_checkpointing and not ckpt_active else "")
+    )
 
     # ---- 训练 ----
     log(f"\n[4/5] 开始训练（{cfg.epochs} epochs）...\n")
@@ -299,6 +318,7 @@ def main() -> None:
         "gpu": torch.cuda.get_device_name(0) if device == "cuda" else None,
         "total_params": total,
         "trainable_params": trainable,
+        "gradient_checkpointing_active": ckpt_active,
         "best_val_acc": best_val_acc,
         "test_acc": test_stats["acc"],
         "test_loss": test_stats["loss"],
