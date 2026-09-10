@@ -204,8 +204,3 @@ def test_exit_code_stays_one_on_cp1252(tmp_path):
     )
     assert "::error file=" in proc.stdout, f"没有产生注解\n{proc.stdout[-2000:]}"
     assert "中文断言消息" in proc.stdout
-
-
-def test_temp_verify_annotation_channel():
-    """【临时】验证 CI 注解通道：这条失败应当出现在 CI 的 check annotation 里。"""
-    assert 1 == 2, "如果这条出现在 CI 的注解里，说明诊断通道工作正常"
