@@ -122,13 +122,30 @@ def capture_rng(loader: Any = None) -> dict[str, Any]:
     return state
 
 
+def _rng_state_to_cpu(value: Any) -> Any:
+    """把一份 RNG 状态搬回 CPU。
+
+    ⚠️ 这不是多余的。`load_checkpoint` 用 `map_location=device` 加载，
+       会把 checkpoint 里**所有**张量 —— 包括这几份 RNG 状态 —— 一起搬到目标设备。
+       而 `torch.set_rng_state()` / `torch.Generator.set_state()` 只接受 **CPU** 张量，
+       于是 GPU 上续训会抛：
+
+           TypeError: RNG state must be a torch.ByteTensor
+
+       这句报错是**误导**的：它的真实原因是"设备不对"，不是"类型不对" ——
+       张量依然是 `uint8`，只是不在 CPU 上。RNG 状态天然是 CPU 概念
+       （它描述的是采样序列，与算力设备无关），所以这里显式搬回来。
+    """
+    return value.cpu() if isinstance(value, torch.Tensor) else value
+
+
 def restore_rng(state: dict[str, Any], loader: Any = None) -> None:
     """`capture_rng` 的逆操作。缺哪一项就跳过哪一项（老 checkpoint 兼容）。"""
     if "torch" in state:
-        torch.set_rng_state(state["torch"])
+        torch.set_rng_state(_rng_state_to_cpu(state["torch"]))
     if "cuda" in state and torch.cuda.is_available():
         try:
-            torch.cuda.set_rng_state_all(state["cuda"])
+            torch.cuda.set_rng_state_all([_rng_state_to_cpu(s) for s in state["cuda"]])
         except Exception:
             pass
     if "python" in state:
@@ -137,7 +154,7 @@ def restore_rng(state: dict[str, Any], loader: Any = None) -> None:
         np.random.set_state(state["numpy"])
     generator = getattr(loader, "generator", None) if loader is not None else None
     if "loader" in state and generator is not None:
-        generator.set_state(state["loader"])
+        generator.set_state(_rng_state_to_cpu(state["loader"]))
 
 
 # ============================================================

@@ -534,6 +534,31 @@ run with USE_LIBUV=0 to disable it
 
 > 真实训练环境（Linux + 多卡）请用 `torchrun`：它带弹性容错和更完善的进程管理。
 
+### 另一个 Windows 专属的坑：CUDA 可用 ≠ NCCL 可用
+
+`backend` 原来是这么选的：`"nccl" if torch.cuda.is_available() else "gloo"`。
+在 Windows 上它直接崩：
+
+```
+RuntimeError: Distributed package doesn't have NCCL built in
+```
+
+因为**「这台机器有 GPU」和「这个 torch 构建编了 NCCL」是两件事** ——
+Windows 版通常 CUDA 可用、NCCL 没编进去。报错发生在 `init_process_group` 里，
+离「backend 选错了」十万八千里，极难定位。
+
+修法是再问一次 `dist.is_nccl_available()`，不可用就退回 gloo（收敛进 `choose_backend()`）：
+
+| 场景 | 修复前 | 修复后 |
+|------|--------|--------|
+| Linux + CUDA + 有 NCCL | nccl | nccl |
+| **Windows + CUDA + 无 NCCL** | **崩** | **gloo（能跑，只是慢）** |
+| 纯 CPU | gloo | gloo |
+
+> 这是本仓库那条思路的延续：`resolve_device()` 要同时查 `is_available()` 和
+> `device_count()`、`compile_support` 要先探测再编译、`SyncBatchNorm` 要按 backend 判定 ——
+> 都是同一个道理：**「看起来能用」和「真的能用」是两件事。**
+
 ## `torch.compile`：为什么它在 Windows 上通常用不了
 
 `torch.compile(model)` 在 Linux 上基本是一行搞定的加速手段，但在 Windows 上
@@ -831,6 +856,36 @@ lr 调度器（它闭包住了 base_lr）还会用新配置的 lr 覆盖回去�
 
 这是续训最危险的失败模式：用户以为接上了，实际白训一遍，而 `summary.json` 里的
 loss 曲线看起来一切正常 —— 等发现时已经烧掉了几个小时。
+
+### 一个只在 GPU 上出现的 bug：RNG 状态被 `map_location` 搬上了卡
+
+这个功能在 CPU 上跑了很久、反证也做过三轮，但**第一次在 GPU 上续训就崩了**：
+
+```
+TypeError: RNG state must be a torch.ByteTensor
+  File "src/checkpoint.py", line 128, in restore_rng
+    torch.set_rng_state(state["torch"])
+```
+
+报错信息是**误导**的 —— 类型没错（依然是 `uint8`），错的是**设备**：
+
+- `load_checkpoint` 用 `map_location=device` 加载，会把 checkpoint 里**所有**张量
+  搬到目标设备，**包括那几份 RNG 状态**；
+- 而 `torch.set_rng_state()` / `torch.Generator.set_state()` 只接受 **CPU** 张量。
+
+RNG 状态描述的是「采样序列走到哪了」，天然是 CPU 概念、与算力设备无关 ——
+所以修法是显式搬回来（`_rng_state_to_cpu`）。
+
+**为什么测试没抓住**：现有**全部**测试都用 `map_location="cpu"` 加载，
+「把 RNG 状态搬上卡」这条代码路径从没被走到过。这是「本地绿、CI 红」的镜像版本 ——
+这次是**「CPU 绿、GPU 红」**，而 CI 本身也是 CPU-only，所以连 CI 都抓不到。
+
+补的测试（`test_restore_rng_accepts_state_that_was_moved_off_cpu`）**本机跑、CI skip**：
+CI 没有 GPU、造不出"被搬走的 RNG 状态"；但本机必须能跑 —— 否则这个 bug 会再藏回去。
+
+> 面试点：`map_location` 的语义是"把**整个** checkpoint 搬到某设备"，它对
+> "哪些张量其实不该跟着走"一无所知。凡是**描述状态而不是参与计算**的 tensor
+> （RNG 状态、步数、统计计数）都要留意这一类陷阱。
 
 ## 核心代码位置（想学就看这几个文件）
 

@@ -116,6 +116,22 @@ def rendezvous_file() -> str | None:
     return value or None
 
 
+def choose_backend(has_cuda: bool) -> str:
+    """选集合通信后端：能上 NCCL 就 NCCL，否则 gloo。
+
+    ⚠️ **不能只看 `torch.cuda.is_available()`**。它只说明「这台机器有 GPU」，
+       **不代表这个 torch 构建编了 NCCL** —— Windows 版就是典型：CUDA 可用、
+       NCCL 没编进去。此时直接选 `nccl` 会在 `init_process_group` 里抛
+
+           RuntimeError: Distributed package doesn't have NCCL built in
+
+       这个报错发生在进程组初始化处，离「backend 选错了」很远，很难定位。
+       所以必须再问一次 `dist.is_nccl_available()`：不可用就退回 `gloo` ——
+       算出来的结果一样对，只是慢（gloo 走 socket，走不了 NVLink/PCIe）。
+    """
+    return "nccl" if (has_cuda and dist.is_nccl_available()) else "gloo"
+
+
 def setup_distributed(
     requested_device: str = "auto",
     timeout_minutes: int = 30,
@@ -154,7 +170,17 @@ def setup_distributed(
     has_cuda = requested_device.startswith("cuda") or (
         requested_device == "auto" and torch.cuda.is_available()
     )
-    backend = "nccl" if has_cuda else "gloo"
+    # 后端选择的全部理由见 `choose_backend()`
+    backend = choose_backend(has_cuda)
+    if has_cuda and backend == "gloo" and rank == 0:
+        print(
+            "  [分布式] 检测到 CUDA，但本 torch 构建未编入 NCCL，已退回 gloo（CPU 集合通信）。"
+            "要跑多卡请换装带 NCCL 的构建。"
+        )
+        print(
+            "  [分布式] 检测到 CUDA，但本 torch 构建未编入 NCCL，已退回 gloo（CPU 集合通信）。"
+            "要跑多卡请换装带 NCCL 的构建。"
+        )
 
     if not dist.is_initialized():
         rv_file = rendezvous_file()

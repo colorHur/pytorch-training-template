@@ -37,6 +37,18 @@ from src.model import build_model
 IMAGE_SIZE = 28
 
 
+def _cuda_device_is_really_usable() -> bool:
+    """判断「**真的**能建 CUDA 张量」—— 比 `is_available()` 严格。
+
+    ⚠️ `CUDA_VISIBLE_DEVICES=""` 时 `is_available()` 仍可能返回 True（驱动可见），
+       而 `device_count()` 是 0；此时去建 CUDA 张量直接抛
+       `RuntimeError: ... torch.cuda.device_count() is 0`。
+       `src/config.py::resolve_device()` 正是同时查这两个条件，这里同理 ——
+       （写这条测试时我先拿 `is_available()` 当了判据，结果又被这套环境抓了一次。）
+    """
+    return torch.cuda.is_available() and torch.cuda.device_count() > 0
+
+
 # ============================================================
 # 脚手架
 # ============================================================
@@ -417,6 +429,54 @@ def test_load_checkpoint_restores_the_shuffle_stream(tmp_path):
 
     load_checkpoint(path, loader=loader)
     assert epoch_order(loader) == expected, "shuffle 流没有被还原 —— 续训的数据顺序会跑偏"
+
+
+# ============================================================
+# RNG 状态必须回到 CPU —— `map_location` 会把它一起搬走
+# ============================================================
+def test_restore_rng_accepts_state_that_was_moved_off_cpu():
+    """`--resume` 在 GPU 上崩过：RNG 状态被 `map_location` 搬上了卡。
+
+    `load_checkpoint` 用 `map_location=device` 加载，会把 checkpoint 里**所有**
+    张量一起搬到目标设备 —— 包括这几份 RNG 状态。而 `set_rng_state()` 只吃
+    **CPU** 张量，于是 GPU 上续训直接抛：
+
+        TypeError: RNG state must be a torch.ByteTensor
+
+    这句报错是**误导**的：张量仍然是 `uint8`，只是设备不对。修法是显式 `.cpu()`。
+
+    ⚠️ 只能在有 GPU 的机器上真复现（`map_location` 的目标得是 cuda），
+       CI 是 CPU-only 会 skip —— **但本机必须能跑**，否则这个 bug 又会藏回去。
+    """
+    if not _cuda_device_is_really_usable():
+        pytest.skip("需要 GPU：只有 map_location 指向 cuda 才会把 RNG 状态搬离 CPU")
+
+    torch.manual_seed(1234)
+    expected = torch.get_rng_state().clone()
+
+    moved = {"torch": expected.cuda()}      # 模拟 map_location=cuda 的结果
+    torch.manual_seed(999)                  # 先把现场弄乱
+    restore_rng(moved)                      # 修复前：这里抛 TypeError
+
+    assert torch.equal(torch.get_rng_state().cpu(), expected), "RNG 状态没被还原"
+
+
+def test_load_checkpoint_on_cuda_restores_everything(tmp_path):
+    """端到端：在 GPU 上加载 checkpoint 之后，训练必须能接着跑。
+
+    这是 `--resume` 在 GPU 上的真实路径 —— 而现有测试**全部**用
+    `map_location="cpu"` 加载，所以「RNG 状态被搬上卡」这段代码从来没被走到过。
+    """
+    if not _cuda_device_is_really_usable():
+        pytest.skip("需要 GPU：这条路径就是 map_location=cuda")
+
+    loader = make_loader()
+    path = save_at(
+        tmp_path, "gpu.pt",
+        make_model(), make_optimizer(make_model(seed=1)), loader=loader,
+    )
+
+    load_checkpoint(path, model=make_model().to("cuda"), loader=loader, device="cuda")
 
 
 # ============================================================

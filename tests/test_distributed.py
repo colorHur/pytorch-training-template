@@ -19,6 +19,7 @@ from src.distributed import (
     StridedSampler,
     build_eval_sampler,
     build_train_sampler,
+    choose_backend,
     env_world_size,
     maybe_convert_sync_bn,
     reduce_sums,
@@ -110,6 +111,35 @@ def test_setup_distributed_is_disabled_without_torchrun(monkeypatch):
     assert ctx.world_size == 1
     assert ctx.is_main is True
     assert "单进程" in ctx.describe()
+
+
+def test_backend_prefers_nccl_when_it_is_available(monkeypatch):
+    """有 CUDA 且 NCCL 可用 → 用 nccl（多卡最快的那条路）。"""
+    import torch.distributed as dist
+
+    monkeypatch.setattr(dist, "is_nccl_available", lambda: True)
+    assert choose_backend(has_cuda=True) == "nccl"
+
+
+def test_backend_falls_back_to_gloo_when_nccl_is_missing(monkeypatch):
+    """有 CUDA 但 torch 没编 NCCL（Windows 版正是如此）→ 必须退回 gloo。
+
+    没有这条回落，本机跑 DDP 会在 `init_process_group` 里抛
+    `RuntimeError: Distributed package doesn't have NCCL built in` ——
+    报错点离「backend 选错了」很远，是 Windows + CUDA 用户的必踩坑。
+    """
+    import torch.distributed as dist
+
+    monkeypatch.setattr(dist, "is_nccl_available", lambda: False)
+    assert choose_backend(has_cuda=True) == "gloo"
+
+
+def test_backend_is_gloo_without_cuda(monkeypatch):
+    """没有 GPU 时不谈 NCCL —— 即使库里报可用，也走 gloo。"""
+    import torch.distributed as dist
+
+    monkeypatch.setattr(dist, "is_nccl_available", lambda: True)
+    assert choose_backend(has_cuda=False) == "gloo"
 
 
 def test_rendezvous_file_reads_env(monkeypatch):
