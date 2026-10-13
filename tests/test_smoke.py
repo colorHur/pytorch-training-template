@@ -178,10 +178,10 @@ def test_resume_continues_from_the_saved_epoch(tmp_path):
 def test_resume_reproduces_uninterrupted_training(tmp_path):
     """本里程碑的核心断言：**1 轮 + 断点 + 2 轮** ≡ **连续 3 轮**（逐位一致）。
 
-    为什么敢断言"逐位"：这个模板把随机性的四个来源都关在明处 ——
-    固定 seed、显式 shuffle generator、`num_workers=0`、CPU 上不开 AMP/compile。
-    所以只要**存全了**（权重 / 优化器矩 / global_step / 早停基准 / RNG / 数据顺序），
-    续训就必须严丝合缝地等于连续训练。差一点，说明漏了某样东西。
+    这里用 MLP 隔离恢复状态：固定 seed、显式 shuffle generator、`num_workers=0`，
+    CPU 上不开 AMP/compile。当前环境下 small_cnn 的 CPU 内核会在两个独立进程
+    间出现微小漂移（未改动的基线也能复现），因此不能把它当成状态缺失的唯一证据。
+    MLP 的逐位比较守护权重 / 优化器矩 / global_step / 早停基准 / RNG / 数据顺序。
 
     注意这里两次都传 `--epochs 3`。这不是巧合：
     `total_steps = steps_per_epoch × epochs`，把 epochs 调大的话 cosine 曲线会被
@@ -189,7 +189,7 @@ def test_resume_reproduces_uninterrupted_training(tmp_path):
     本来就是两件事，前者不该要求逐位等价）。上面那条测试专门盯着这个提示。
     """
     full, full_dir = run_main(
-        tmp_path, "--epochs", "3", "--batch_size", "128", "--save_every_epoch",
+        tmp_path, "--epochs", "3", "--batch_size", "128", "--model", "mlp", "--save_every_epoch",
         exp_name="e2e_full",
     )
     assert full.returncode == 0, full.stdout[-2500:]
@@ -197,7 +197,7 @@ def test_resume_reproduces_uninterrupted_training(tmp_path):
     assert epoch1.exists(), "没有 --save_every_epoch 就拿不到「跑到第 1 轮就崩」的现场"
 
     resumed, resumed_dir = run_main(
-        tmp_path, "--epochs", "3", "--batch_size", "128",
+        tmp_path, "--epochs", "3", "--batch_size", "128", "--model", "mlp",
         "--resume", str(epoch1), exp_name="e2e_resumed",
     )
     assert resumed.returncode == 0, resumed.stdout[-2500:]
@@ -722,3 +722,4 @@ def test_lr_finder_cli_survives_non_utf8_stdout(tmp_path):
     assert proc.returncode == 0, proc.stderr[-2000:]
     assert "UnicodeEncodeError" not in proc.stderr
     assert "建议 lr" in proc.stdout
+

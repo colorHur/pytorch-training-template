@@ -9,23 +9,28 @@
 这个仓库不只是「能跑」——**每个显存优化手段都配了实测数据**（7 个对照变体 + 单步拆解），
 包括一个实测抓出来的反直觉结论：梯度检查点把前向保活的激活砍掉 83%，训练峰值却只降 13%。
 
+**先上手：**`python src/main.py --dataset synthetic --epochs 1`（离线）；
+**查正确性：**`python -m pytest tests/test_train.py -q`；
+**系统学习：**[两周课程](docs/learning/README.md) → [一次参数更新的推导与实验](docs/learning/02-gradient-accumulation.md) → [工程实践手册](docs/learning/03-engineering-practice.md)。
+课程包含手算、反例、破坏实验和自测题；先做实验，再看结论。
+
 ## 特性
 
 | 能力 | 说明 |
 |------|------|
 | **配置系统** | YAML + dataclass，命令行可覆盖任意参数；配置随 checkpoint 一起保存，实验可复现 |
 | **手写训练循环** | 不用 Lightning/Trainer，每一步（清零→前向→反向→裁剪→更新）都显式写出 |
-| **梯度累积** | 小显存跑等效大 batch，显存不增长 |
+| **梯度累积** | 按实际样本数归一化，覆盖尾窗口和不等长末批；BN/Dropout 场景不承诺与大 batch 严格等价 |
 | **混合精度** | `torch.autocast` + `GradScaler`，含梯度还原时机 |
 | **梯度检查点** | 不保存块内激活、反向重算，用计算换显存；含 BN 统计量陷阱的处理说明 |
 | **手写 LR 调度** | warmup + cosine/step，能看到 lr 每一步怎么变（不是黑盒 `scheduler.step()`） |
 | **梯度裁剪** | 按全局 L2 范数裁剪，防梯度爆炸 |
 | **显存监控** | 每 epoch 打印当前/峰值显存 |
 | **checkpoint** | 每个 epoch 落 `last.pt`（续训目标）+ 最优 `best.pt`；含配置与**全部可恢复状态** |
-| **断点续训** | `--resume last` 接着训；恢复权重 / Adam 矩 / `global_step` / 早停基准 / 两股随机流 → 与连续训练**逐位一致** |
+| **断点续训** | `--resume last` 恢复权重、优化器、进度和随机状态；逐位一致须限定模型、设备和执行环境，见下文测试边界 |
 | **分布式训练 (DDP)** | 同一份 `main.py` 单卡/多卡通用（`torchrun` 自动识别）；数据分片、梯度平均、指标归约、rank0 独占落盘；含不依赖 TCPStore 的启动器 |
 | **学习率 finder** | LR range test：训练前扫一遍 lr 报告该用多少；等比取点 + 偏差修正 EMA + 权重零污染还原，输出 ASCII 曲线 |
-| **测试 + CI** | 227 个 pytest 用例（CPU 可跑，多平台 CI）；离线合成数据集，秒级验证整条流水线 |
+| **测试 + CI** | pytest + 多平台 CPU CI；离线合成数据集验证训练、累积、恢复与分布式边界 |
 
 ## 目录结构
 
@@ -150,7 +155,7 @@ python experiments/exp_ddp_equivalence.py
 
 ```bash
 pip install -r requirements-dev.txt
-pytest                                    # 227 个用例，CPU 上约 4 分钟
+python -m pytest -q                       # 测试数量以本次收集结果为准
 ruff check src experiments tests tools    # lint
 
 # 不想等下载？用内置的合成数据集跑通整条流水线
@@ -780,9 +785,13 @@ for epoch in range(state.next_epoch, cfg.epochs + 1):
 | 各轮 `train_loss` | 0.6148 / 0.0015 / 0.0008 | 完全相同 |
 | 同上但跑 DDP（2 进程） | — | **0 / 18**（多一组 `set_epoch()` 的约束） |
 
-为什么敢断言"逐位"：这个模板把随机性的来源都关在明处（固定 seed、显式 shuffle
-generator、`num_workers=0`、CPU 上不开 AMP / compile），所以只要**存全了**，
-续训就必须严丝合缝。差一点，就说明漏了某一样 —— 这正是这条测试的价值：
+**口径更新：**表中数字属于当时的固定环境实验，不能推广成任意设备、内核和模型下的逐位保证。
+当前 Windows CPU/PyTorch 环境中，未改动的原版 `small_cnn` 续训精确比较也会出现微小漂移；
+精确回归测试改用 MLP 隔离状态恢复，并保留 CNN 的其他行为测试。见
+[工程手册的可复现层级](docs/learning/03-engineering-practice.md)。
+固定 seed、显式 shuffle generator、`num_workers=0` 和关闭 AMP/compile 是必要条件，
+但仍不能自动消除所有内核非确定性。差异出现时需要继续定位，不能直接断言漏存状态。
+这条测试的价值是：
 它不是"验证能跑"，而是**把"六类状态缺一不可"变成一个可执行的断言**。
 
 配套的还有一组反证测试（在 `tests/test_checkpoint.py`）：故意摘掉某一项，断言结果真的变了 ——
@@ -832,7 +841,7 @@ generator、`num_workers=0`、CPU 上不开 AMP / compile），所以只要**存
 
 这不是 bug，而是两件本来就不同的事：
 
-- **崩了重来**（`--epochs` 不变）→ 要求严格等价，本仓库做到了逐位一致；
+- **崩了重来**（`--epochs` 不变）→ 应做配对等价验证；逐位一致还取决于模型与执行环境；
 - **接着训到更多轮**（`--epochs` 变大）→ 重新规划 lr 曲线是**期望行为**，
   这时候不该要求逐位等价。
 
@@ -1063,8 +1072,9 @@ DDP 下只剩**一股** —— 训练集用的是 `DistributedSampler`，它每�
 数据顺序就整体错位 —— 而 loss 曲线依然"很正常"、进程内单测全绿，只有把两段 loss
 摆在一起才看得出来（实测：16 / 18 个张量不同）。
 
-反过来说，DDP 下"可复现"的门槛其实**更低**：只要 `set_epoch(真实 epoch)` 守住了，
-再加上权重 / 优化器矩 / `global_step` 恢复对，就能逐位一致（实测 0 / 18）。
+反过来说，DDP 的数据顺序主要依赖 `set_epoch(真实 epoch)`；再恢复权重、优化器状态和
+`global_step`，才能在固定实验条件下检验逐位一致。0/18 是上述历史实验结果，
+不能当作任意模型与设备的通用保证。
 
 **Q28: 怎么把"可复现"从一句口号变成一条被验证的性质？**
 一条正向断言 + 一条反向断言，缺一不可：
@@ -1089,8 +1099,8 @@ DDP 下只剩**一股** —— 训练集用的是 `DistributedSampler`，它每�
       真正的加速对比需要 Linux —— 本机拿不到，所以没编数据）
 - [x] 学习率 finder（LR range test）：等比扫描 + 偏差修正 EMA + 权重零污染还原，
       实测 MNIST 上 100 步 16 秒、建议值 1.262e-3（与默认 lr 差 0.79×）
-- [x] 断点续训（`--resume last|best|<path>`）：六类状态 + 两股随机流全恢复，
-      实测「1 轮 + 续训 2 轮」与「连续 3 轮」权重**逐位一致**（0/18 个张量不同）
+- [x] 断点续训（`--resume last|best|<path>`）：恢复六类状态 + 两股随机流；
+      历史固定环境实验得到 0/18 个张量不同，当前精确回归使用 MLP，适用范围见上文
 - [x] 分布式 checkpoint：rank0 独占落盘（`if ctx.is_main`），各 rank 读同一份存档。
       恢复阶段**不需要 barrier** —— 全部 rank 都是只读，没有人会在别人读到一半时写；
       真正需要 barrier 的是**训练结束后**读 `best.pt` 那一步（等 rank0 写完，
@@ -1110,3 +1120,4 @@ DDP 下只剩**一股** —— 训练集用的是 `DistributedSampler`，它每�
 ## License
 
 MIT
+

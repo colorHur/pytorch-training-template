@@ -9,16 +9,23 @@
 from __future__ import annotations
 
 import math
+from contextlib import contextmanager
+from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, TensorDataset
 
 from src.config import TrainConfig
 from src.data import SyntheticDataset
 from src.model import build_model
-from src.train import build_lr_scheduler, evaluate, train_one_epoch
+from src.train import (
+    build_lr_scheduler,
+    evaluate,
+    optimizer_steps_per_epoch,
+    train_one_epoch,
+)
 
 BASE_LR = 1e-3
 
@@ -198,6 +205,73 @@ def test_gradient_accumulation_update_count(n_samples, batch_size, accum, expect
     assert global_step == expected_updates
 
 
+@pytest.mark.parametrize("num_batches,accum,expected", [(0, 4, 0), (3, 4, 1), (7, 3, 3)])
+def test_scheduler_counts_partial_update_window(num_batches, accum, expected):
+    assert optimizer_steps_per_epoch(num_batches, accum) == expected
+
+
+@pytest.mark.parametrize("sample_count,accum", [(7, 4), (9, 3)])
+def test_accumulation_matches_real_batch_even_with_short_last_batch(sample_count, accum):
+    """比较参数数值，而非只数 step；同时覆盖短窗口和不等长 microbatch。"""
+    torch.manual_seed(7)
+    x = torch.randn(sample_count, 3)
+    y = torch.arange(sample_count) % 2
+    initial = nn.Linear(3, 2)
+    accumulated = nn.Linear(3, 2)
+    reference = nn.Linear(3, 2)
+    accumulated.load_state_dict(initial.state_dict())
+    reference.load_state_dict(initial.state_dict())
+    micro_loader = DataLoader(TensorDataset(x, y), batch_size=2, shuffle=False)
+    cfg = TrainConfig(grad_accum_steps=accum, max_grad_norm=0, amp=False)
+    actual_optimizer = torch.optim.SGD(accumulated.parameters(), lr=0.1)
+    expected_optimizer = torch.optim.SGD(reference.parameters(), lr=0.1)
+    criterion = nn.CrossEntropyLoss()
+
+    train_one_epoch(
+        accumulated, micro_loader, actual_optimizer, criterion,
+        "cpu", epoch=1, cfg=cfg, global_step=0,
+    )
+    window_size = 2 * accum
+    for start in range(0, sample_count, window_size):
+        expected_optimizer.zero_grad(set_to_none=True)
+        loss = criterion(reference(x[start:start + window_size]), y[start:start + window_size])
+        loss.backward()
+        expected_optimizer.step()
+
+    for actual, expected in zip(accumulated.parameters(), reference.parameters()):
+        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+
+
+def test_no_sync_contains_forward_as_well_as_backward():
+    class ObservedModel(nn.Linear):
+        def __init__(self):
+            super().__init__(3, 2)
+            self.in_no_sync = False
+            self.forward_inside = []
+
+        @contextmanager
+        def no_sync(self):
+            self.in_no_sync = True
+            try:
+                yield
+            finally:
+                self.in_no_sync = False
+
+        def forward(self, x):
+            self.forward_inside.append(self.in_no_sync)
+            return super().forward(x)
+
+    model = ObservedModel()
+    loader = DataLoader(TensorDataset(torch.randn(4, 3), torch.tensor([0, 1, 0, 1])), batch_size=2)
+    cfg = TrainConfig(grad_accum_steps=2, amp=False)
+    ctx = SimpleNamespace(enabled=True, world_size=1)
+    train_one_epoch(
+        model, loader, torch.optim.SGD(model.parameters(), lr=0.1),
+        nn.CrossEntropyLoss(), "cpu", epoch=1, cfg=cfg, global_step=0, ctx=ctx,
+    )
+    assert model.forward_inside == [True, False]
+
+
 def test_zero_grad_called_once_per_accumulation_window():
     cfg, model, optimizer, loader, criterion = _setup(100, 16, 3)
     train_one_epoch(
@@ -264,3 +338,4 @@ def test_longer_training_reduces_loss_on_learnable_data():
         )
     after = evaluate(model, test_loader, criterion, "cpu")["loss"]
     assert after < before * 0.5, f"loss 没降下来：{before:.3f} -> {after:.3f}"
+
