@@ -138,6 +138,13 @@ def build_lr_scheduler(optimizer, name: str, total_steps: int, warmup_steps: int
     return schedule
 
 
+def optimizer_steps_per_epoch(num_batches: int, grad_accum_steps: int) -> int:
+    """一个 epoch 实际更新的次数，包含不足一个窗口的最后一批。"""
+    if num_batches < 0 or grad_accum_steps <= 0:
+        raise ValueError("批次数不能为负，累积步数必须为正")
+    return math.ceil(num_batches / grad_accum_steps)
+
+
 # ============================================================
 # 评测
 # ============================================================
@@ -202,6 +209,7 @@ def train_one_epoch(
     running_loss, seen, correct = 0.0, 0, 0
     t0 = time.time()
     accum = cfg.grad_accum_steps
+    window_samples = 0
 
     for i, (x, y) in enumerate(loader):
         x = x.to(device, non_blocking=True)
@@ -215,27 +223,38 @@ def train_one_epoch(
         if i % accum == 0:
             optimizer.zero_grad(set_to_none=True)
 
-        # ---- 2) 前向 ----
-        with torch.autocast(device_type=device, dtype=torch.float16, enabled=cfg.amp):
-            logits = model(x)
-            loss = criterion(logits, y)
-
-        # ---- 3) 反向 ----
-        # 梯度累积：损失要除以累积步数，否则梯度会放大 accum 倍
-        loss_scaled = loss / accum
-        # DDP + 梯度累积：中间几步用 no_sync() 跳过 all-reduce（纯通信优化，
-        # 不加结果也对，只是白通信 —— 见 distributed.ddp_no_sync 的说明）
+        # criterion 使用样本均值；先还原为样本损失之和，窗口末尾再统一除以样本数。
+        # 这样最后不足 accum 批、或最后一批较小时，仍与真实大 batch 一致。
+        batch_samples = y.size(0)
+        window_samples += batch_samples
+        # DDP 的 no_sync 必须同时包住 forward 和 backward，否则仍会同步梯度。
         with ddp_no_sync(model, ctx, skip=not is_update_step):
+            with torch.autocast(
+                device_type=torch.device(device).type, dtype=torch.float16, enabled=cfg.amp
+            ):
+                logits = model(x)
+                loss = criterion(logits, y)
+            loss_sum = loss * batch_samples
             if scaler is not None:
-                scaler.scale(loss_scaled).backward()
+                scaler.scale(loss_sum).backward()
             else:
-                loss_scaled.backward()
+                loss_sum.backward()
 
         # ---- 4) 参数更新（攒够 accum 步才更新）----
         if is_update_step:
+            if scaler is not None:
+                scaler.unscale_(optimizer)
+
+            # DDP 默认把各 rank 的梯度取平均；乘回 world_size 后除以全局样本数。
+            # 同一窗口内各 rank 必须走相同数量的 micro-step（训练采样器保证这一点）。
+            global_samples = reduce_sums([window_samples], ctx)[0]
+            world_size = ctx.world_size if ctx is not None and ctx.enabled else 1
+            grad_scale = world_size / global_samples
+            for param in model.parameters():
+                if param.grad is not None:
+                    param.grad.mul_(grad_scale)
+
             if cfg.max_grad_norm > 0:
-                if scaler is not None:
-                    scaler.unscale_(optimizer)   # 裁剪前必须先把梯度还原成真实尺度
                 # 梯度裁剪：把梯度的全局 L2 范数限制在 max_grad_norm 内
                 torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
 
@@ -251,6 +270,7 @@ def train_one_epoch(
                 optimizer.step()
 
             global_step += 1
+            window_samples = 0
 
         # ---- 5) 统计 ----
         running_loss += loss.item() * y.size(0)
@@ -275,3 +295,4 @@ def train_one_epoch(
         "lr": optimizer.param_groups[0]["lr"],
     }
     return stats, global_step
+

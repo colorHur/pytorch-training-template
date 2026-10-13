@@ -58,6 +58,7 @@ from src.train import (
     build_lr_scheduler,
     build_optimizer,
     evaluate,
+    optimizer_steps_per_epoch,
     set_seed,
     train_one_epoch,
 )
@@ -355,12 +356,12 @@ def run_training() -> None:
     if cfg.compile:
         log(f"      torch.compile：{compile_outcome.message}")
 
-    steps_per_epoch = len(loaders["train"]) // cfg.grad_accum_steps
+    steps_per_epoch = optimizer_steps_per_epoch(len(loaders["train"]), cfg.grad_accum_steps)
     total_steps = steps_per_epoch * cfg.epochs
     lr_schedule = build_lr_scheduler(optimizer, cfg.lr_scheduler, total_steps, cfg.warmup_steps)
 
     # AMP 的 GradScaler 只在 CUDA + amp 开启时使用
-    scaler = torch.amp.GradScaler("cuda") if (cfg.amp and device == "cuda") else None
+    scaler = torch.amp.GradScaler("cuda") if (cfg.amp and torch.device(device).type == "cuda") else None
 
     log(
         f"[3/5] 优化器 {cfg.optimizer}(lr={cfg.lr}) | 调度器 {cfg.lr_scheduler} | "
@@ -623,3 +624,4 @@ def main() -> None:
 if __name__ == "__main__":
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     main()
+
