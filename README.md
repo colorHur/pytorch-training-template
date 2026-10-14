@@ -11,8 +11,8 @@
 
 **先上手：**`python src/main.py --dataset synthetic --epochs 1`（离线）；
 **查正确性：**`python -m pytest tests/test_train.py -q`；
-**系统学习：**[两周课程](docs/learning/README.md) → [一次参数更新的推导与实验](docs/learning/02-gradient-accumulation.md) → [工程实践手册](docs/learning/03-engineering-practice.md)。
-课程包含手算、反例、破坏实验和自测题；先做实验，再看结论。
+**系统学习：**[七节完整课程](docs/learning/README.md)，覆盖基础、配置、训练更新、显存精度、续训、DDP、测试与交付。
+每节包含原理、源码阅读、可运行实验、工程边界、反证、自测和参考答案，建议分两晚完成。
 
 ## 特性
 
@@ -787,8 +787,8 @@ for epoch in range(state.next_epoch, cfg.epochs + 1):
 
 **口径更新：**表中数字属于当时的固定环境实验，不能推广成任意设备、内核和模型下的逐位保证。
 当前 Windows CPU/PyTorch 环境中，未改动的原版 `small_cnn` 续训精确比较也会出现微小漂移；
-精确回归测试改用 MLP 隔离状态恢复，并保留 CNN 的其他行为测试。见
-[工程手册的可复现层级](docs/learning/03-engineering-practice.md)。
+精确回归测试改用 MLP 隔离状态恢复，并保留 CNN 的其他行为测试；漂移根因尚未完成隔离。见
+[第五节的可复现边界](docs/learning/05-checkpoint-and-reproducibility.md)。
 固定 seed、显式 shuffle generator、`num_workers=0` 和关闭 AMP/compile 是必要条件，
 但仍不能自动消除所有内核非确定性。差异出现时需要继续定位，不能直接断言漏存状态。
 这条测试的价值是：
