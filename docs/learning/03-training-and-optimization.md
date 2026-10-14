@@ -2,6 +2,12 @@
 
 [上一节](02-configuration-and-cli.md) · [目录](README.md) · [下一节](04-precision-memory-and-performance.md)
 
+## 0. 先修、阅读路径与闭卷检查
+
+先修：链式法则、均值与加权均值、第一节训练循环。第一遍专注窗口分母和数值参照；第二遍加 optimizer/裁剪/scheduler；进阶再审 LR finder 状态与 token loss。若梯度推导不清，先做第 10 段交叉熵实验。
+
+迁移任务：把 criterion 从 mean 改为 sum，说明哪些地方不能再乘 batch_samples；进一步设计 padding token 的有效分母，但不要求立刻训练 LLM。闭卷答 [Q09–Q12](INTERVIEW.md#lesson-3)。
+
 第一晚推导累积梯度并做数值对照，第二晚读优化器、调度器与 LR finder。目标是能解释一次更新的分子、分母和时钟，判断“等效 batch”的前提，读懂为什么一次参数更新并不等于一次前向。
 
 ## 1. 三种 step 必须分清
@@ -136,3 +142,24 @@ AdamW 的衰减近似是额外按当前参数做缩小；Adam 的梯度归一化
 还有一个常见误读：训练 loop 中 loss 先乘 batch_samples 用于求导，但写日志仍使用未乘样本数的平均 loss，并按样本数累计统计。用于 backward 的张量与用于报告的数值可以不同；看清变量用途，不能因为有 `loss_sum` 就直接在日志里当平均 loss。
 
 源码精读顺序：先标 `is_update_step` 与 zero_grad 的窗口边界，再追 loss→loss_sum→grad_scale，最后追 scheduler(global_step) 与 step。打印窗口样本数和更新前学习率建立短轨迹；正式训练移除临时 debug 打印，避免 CUDA 每批同步影响性能。
+
+## 10. 把交叉熵公式接到 autograd
+
+单样本标签 y、logits z：`L=log(Σ_j exp(z_j))-z_y`，对 z_k 求导得到 `p_k-1[k=y]`。普通 batch mean 再除 B；这是没有类别权重、ignore_index 或概率标签的基础条件。稳定实现用 log-sum-exp 技巧，不能用大数指数手算代码替代库中的稳定 loss。
+
+```python
+# 可运行实验：cross_entropy 的 logits 梯度
+import torch
+from torch.nn import functional as F
+
+logits = torch.tensor([[2.0, 0.0, -1.0], [0.0, 1.0, 2.0]], dtype=torch.float64, requires_grad=True)
+labels = torch.tensor([0, 2])
+F.cross_entropy(logits, labels, reduction='mean').backward()
+expected = logits.detach().softmax(dim=1)
+expected[torch.arange(2), labels] -= 1
+expected /= 2
+torch.testing.assert_close(logits.grad, expected)
+print('解析梯度与 autograd 一致:', logits.grad)
+```
+
+预测题：改成 reduction=sum，其他输入不变，梯度应是上面结果的两倍。若“模型输出先 softmax 再 CrossEntropyLoss”，库会把概率当新的 logits，计算已不是同一个目标。理解这一步后再谈损失下降、梯度尺度和 accum 分母。

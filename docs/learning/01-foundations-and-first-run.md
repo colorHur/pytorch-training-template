@@ -2,6 +2,12 @@
 
 [课程目录](README.md) · [下一节](02-configuration-and-cli.md)
 
+## 0. 先修、阅读路径与闭卷检查
+
+先修只需 Python 变量/函数/for、张量形状和最小导数；不会链式法则时先做第 9 段共享节点实验。第一遍完成环境、标量求导和最小分类循环；第二遍画模块/数据/状态关系；进阶再看验证 transform 与共享存储边界。
+
+迁移任务：把二分类改成三类，先说明 logits/标签形状与 loss 输入，再改代码。闭卷检查 [Q01–Q04](INTERVIEW.md#lesson-1)，先不要展开答案；运行循环成功只证明跑通，能解释 grad、buffer 与模式区别才继续。
+
 第一晚检查环境、完成自动微分实验和离线运行；第二晚理解模型、数据流、产物与自测。先问自己：梯度存在哪里？`eval()` 会关闭求导吗？`step()` 使用什么更新参数？batch 的第一维代表什么？不会的题带着问题读下去。
 
 ## 1. 确认解释器与工作目录
@@ -160,3 +166,26 @@ print('固定集合前后 loss:', before, after, 'accuracy:', accuracy)
 尝试三种变化，每次只变一种：把 lr 改小看有限预算下下降速度；从循环中暂时移除 step 看参数为何不变；每批清零改成每两批清零，解释为何需要第三节的正确分母。先预测方向，但不要保证所有超参都产生单调 loss。
 
 对照本项目，额外代码解决的具体问题是：配置让命令可追溯，日志让结果可查，checkpoint 让状态可恢复，测试把边界变成判据，DDP 则增加多进程数据与通信协议。先能说出这层增加的责任，再进入后续章节。
+
+## 9. 共享节点的梯度为何相加
+
+参考 micrograd 的小计算图思路，用自己的例子：`a=w*w`，`L=a+a`。L 对 a 的导数为 2；a 对 w 的两个输入分支各贡献 w，因此 dL/dw=4w。w=3 时梯度为 12。这是图中多路径贡献的求和，与“连续两个 backward 累到 .grad”发生在不同层次。
+
+```python
+# 可运行实验：共享节点的链式法则与有限差分
+import torch
+
+w = torch.tensor(3.0, dtype=torch.float64, requires_grad=True)
+a = w * w
+loss = a + a
+loss.backward()
+h = 1e-6
+def f(value):
+    return 2 * value * value
+finite_difference = (f(3.0 + h) - f(3.0 - h)) / (2 * h)
+torch.testing.assert_close(w.grad, torch.tensor(12.0, dtype=torch.float64))
+assert abs(w.grad.item() - finite_difference) < 1e-6
+print('autograd:', w.grad.item(), '有限差分:', finite_difference)
+```
+
+有限差分是局部数值检查，有步长和浮点误差；非光滑点还要注意导数定义。它不是替代高效反向传播的训练方法。先手画图和贡献，再运行，能看出梯度来自哪些路径。

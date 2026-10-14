@@ -14,6 +14,8 @@
 **系统学习：**[七节完整课程](docs/learning/README.md)，覆盖基础、配置、训练更新、显存精度、续训、DDP、测试与交付。
 每节包含原理、源码阅读、可运行实验、工程边界、反证、自测和参考答案，建议分两晚完成。
 
+配套：[技术栈与能力验收](docs/learning/TECH-STACK.md) · [54 道项目面试追问](docs/learning/INTERVIEW.md) · [参考教程与深度学习方法](docs/learning/STUDY-METHOD.md)。实现、验证、个人掌握程度分别评价，未验证能力不写成已完成成果。
+
 ## 特性
 
 | 能力 | 说明 |

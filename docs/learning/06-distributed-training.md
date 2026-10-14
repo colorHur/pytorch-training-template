@@ -2,6 +2,12 @@
 
 [上一节](05-checkpoint-and-reproducibility.md) · [目录](README.md) · [下一节](07-testing-debugging-and-delivery.md)
 
+## 0. 先修、阅读路径与闭卷检查
+
+先修：单进程累积、样本加权与进程概念。第一遍手算 rank/sample 两个分母并观察 sampler；第二遍走两个 CPU 进程及 no_sync 作用范围；进阶考虑不等长输入与每 rank RNG。先弄清计算和协议，再看吞吐。
+
+迁移任务：构造局部样本数不同的梯度/accuracy 例子，写出全局答案与通信前提。闭卷答 [Q21–Q24](INTERVIEW.md#lesson-6)，CPU gloo 证据不扩大成多 GPU 性能结论。
+
 第一晚用手算和采样实验理解全局语义，第二晚运行两个 CPU 进程并读分布式续训测试。先回答：DDP 会自动把数据切给各 GPU 吗？local_rank 与 rank 一样吗？每个 rank 的准确率平均一下就对了吗？no_sync 只包 backward 能达到预期吗？
 
 ## 1. 一个进程通常管理一份模型副本

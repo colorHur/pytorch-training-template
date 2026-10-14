@@ -2,6 +2,12 @@
 
 [上一节](01-foundations-and-first-run.md) · [目录](README.md) · [下一节](03-training-and-optimization.md)
 
+## 0. 先修、阅读路径与闭卷检查
+
+先修：字典、对象属性、None/False 区别与函数返回。第一遍只跟踪 epochs 和 amp；第二遍读 merge/from_yaml 与 RUN_ONLY_ARGS；进阶设计新参数完整契约。不要先背全表字段。
+
+迁移任务：用新命名的参数实现默认→文件→CLI 覆盖，分别测未传、0、False 和非法值。闭卷答 [Q05–Q08](INTERVIEW.md#lesson-2)，用自己的覆盖实验作证据。
+
 第一晚拆 argparse 与覆盖规则，第二晚做配置实验和源码追踪。学完应能解释 `--epochs 3` 如何变成最终配置，为什么未传值用 None、显式关闭用 False，以及新增一个参数需要维护哪些契约。
 
 ## 1. 一个参数经过哪些对象

@@ -2,6 +2,12 @@
 
 [上一节](04-precision-memory-and-performance.md) · [目录](README.md) · [下一节](06-distributed-training.md)
 
+## 0. 先修、阅读路径与闭卷检查
+
+先修：state_dict、optimizer state、Generator 与训练进度。第一遍做 seed/state 和 MLP 配对；第二遍追创建/加载/迭代顺序；进阶讨论原子保存、worker 与 micro-step 恢复，区分已实现和设计方案。
+
+迁移任务：漏掉一种状态后选一个最早可观察差异，而非只看最终 accuracy。闭卷答 [Q17–Q20](INTERVIEW.md#lesson-5)，明确自己验证的恢复粒度与环境。
+
 第一晚理解存档中的状态并跑恢复实验；第二晚做连续/恢复配对和反证。能加载权重，只证明模型状态能读取。续训还要接上 optimizer、调度进度、随机流和模型选择状态。先问：Adam 第一、二阶统计为什么要存？只恢复 seed 足够吗？在第 3 个 microbatch 中断能直接继续吗？
 
 ## 1. 把训练看成状态机
